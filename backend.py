@@ -179,7 +179,10 @@ class AlpacaBackend:
             if timeframe_str == "5Min": tf = tradeapi.TimeFrame(5, tradeapi.TimeFrameUnit.Minute)
             elif timeframe_str == "15Min": tf = tradeapi.TimeFrame(15, tradeapi.TimeFrameUnit.Minute)
             elif timeframe_str == "1Hour": tf = tradeapi.TimeFrame.Hour
-            limit = 100
+            
+            # 🔥 关键修复 2：把 limit 改大到 1000
+            limit = 1000 
+            
             if "/" in symbol:
                 bars = self.api.get_crypto_bars(symbol, tf, limit=limit).df
             else:
@@ -191,5 +194,6 @@ class AlpacaBackend:
             df.index = pd.to_datetime(df.index)
             return df
         except: return None
+
 
 
