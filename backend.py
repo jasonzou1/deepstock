@@ -26,30 +26,46 @@ class AlpacaBackend:
 
     def get_latest_price_fast(self, symbol):
         """
-        ⚡️【极速通道】仅获取最新价格，不计算指标，不拉K线
-        用于 UI 高频刷新
+        ⚡️【极速通道 - HTTP 修复版】
+        直接请求 API，修复了符号格式问题，并增加了详细的错误打印
         """
         if not self.connected: return 0.0
 
         try:
-            # 1. 加密货币 (HTTP 接口更快)
+            # --- 1. 加密货币 (带 / ) ---
             if "/" in symbol:
-                clean_sym = symbol.replace("/", "")
-                url = f"https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols={clean_sym}"
-                resp = requests.get(url, headers=self.headers, timeout=1.5) # 超时设置短一点
+                # 🔴 关键修复：Alpaca API v1beta3 要求符号必须带 / (例如 BTC/USD)
+                # 之前代码里的 .replace("/", "") 是导致获取不到数据的罪魁祸首
+                
+                # 直接构造 URL，requests 库会自动处理 URL 编码
+                url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/trades"
+                params = {"symbols": symbol} # 这里传 "BTC/USD"
+                
+                # 发送请求
+                resp = requests.get(url, params=params, headers=self.headers, timeout=2)
+                
                 if resp.status_code == 200:
                     data = resp.json()
+                    # 调试打印：让你看到服务器到底返回了什么
+                    # print(f"DEBUG {symbol}: {data}") 
+                    
                     if "trades" in data and symbol in data["trades"]:
-                        return float(data["trades"][symbol]["p"])
-            
-            # 2. 股票
+                        price = float(data["trades"][symbol]["p"])
+                        if price > 0: return price
+                    else:
+                        print(f"⚠️ {symbol} 数据为空，API返回: {data}")
+                else:
+                    print(f"❌ {symbol} HTTP请求失败: {resp.status_code} - {resp.text}")
+
+            # --- 2. 股票 (不带 / ) ---
             else:
                 trade = self.api.get_latest_trade(symbol)
                 return float(trade.price)
                 
         except Exception as e:
-            # 忽略偶尔的网络抖动，返回 0 让 UI 保持上一次价格
-            pass
+            print(f"❌ 获取价格异常 [{symbol}]: {e}")
+            return 0.0
+        
         return 0.0
 
     def get_analysis_data(self, symbol):
@@ -164,3 +180,4 @@ class AlpacaBackend:
             df.index = pd.to_datetime(df.index)
             return df
         except: return None
+
