@@ -185,13 +185,12 @@ class QuantGUI:
         for widget in self.tab_chart.winfo_children(): widget.destroy()
         
         tf = self.combo_tf.get()
-        # 获取 K 线数据
         df = self.backend.get_chart_data(symbol, tf)
         if df is None or df.empty:
             ttk.Label(self.tab_chart, text="无法获取K线数据 (可能是休市或网络问题)").pack(expand=True)
             return
 
-        # 确保 df 的索引是 UTC 时间 (防止时区混乱)
+        # 确保 df 的索引是 UTC 时间
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC')
         else:
@@ -199,7 +198,7 @@ class QuantGUI:
 
         add_plots = []
         
-        # --- 绘制买卖标记 (保持之前的逻辑) ---
+        # --- 绘制买卖标记 ---
         if symbol in self.trade_markers:
             history = self.trade_markers[symbol]
             buys = [float('nan')] * len(df)
@@ -207,26 +206,36 @@ class QuantGUI:
             
             for trade in history:
                 try:
+                    # 解析交易时间并统一转为 UTC
                     t_time = pd.to_datetime(trade['time'])
                     if t_time.tz is None: t_time = t_time.tz_localize('UTC')
                     else: t_time = t_time.tz_convert('UTC')
                     
-                    if t_time < df.index[0] or t_time > df.index[-1]: continue
+                    # 过滤掉比当前图表最早时间还早的数据
+                    if t_time < df.index[0]: 
+                        continue
+
+                    # 找到最近的时间点
                     idx = df.index.get_indexer([t_time], method='nearest')[0]
                     
-                    if trade['action'] == 'BUY': buys[idx] = df.iloc[idx]['low'] * 0.99 
-                    elif trade['action'] == 'SELL': sells[idx] = df.iloc[idx]['high'] * 1.01
-                except: pass
-            
-            if not pd.isna(buys).all():
+                    # 赋值
+                    if trade['action'] == 'BUY': 
+                        buys[idx] = df.iloc[idx]['low'] * 0.99 
+                    elif trade['action'] == 'SELL': 
+                        sells[idx] = df.iloc[idx]['high'] * 1.01
+                except Exception as e:
+                    print(f"Marker Skip: {e}")
+
+            # 🔥 修复点：分开检查，防止空数组报错 "zero-size array to reduction"
+            if any(not pd.isna(x) for x in buys):
                 add_plots.append(mpf.make_addplot(buys, type='scatter', markersize=100, marker='^', color='g'))
-            if not pd.isna(sells).all():
+            
+            if any(not pd.isna(x) for x in sells):
                 add_plots.append(mpf.make_addplot(sells, type='scatter', markersize=100, marker='v', color='r'))
 
-        # --- 🔥 修复核心：动态构建参数 ---
+        # --- 绘制持仓成本线 & 动态构建参数 ---
         qty, pl, avg = self.backend.get_position(symbol)
         
-        # 1. 定义基础参数
         s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True))
         plot_kwargs = dict(
             type='candle',
@@ -239,21 +248,18 @@ class QuantGUI:
             title=f"{symbol} ({tf})"
         )
 
-        # 2. 只有当有持仓时，才添加 hlines 参数！
-        # 之前就是因为没持仓时传了空字典导致报错
         if qty > 0:
             plot_kwargs['hlines'] = dict(hlines=[avg], colors=['blue'], linestyle='-.', linewidths=(1.5))
             plot_kwargs['title'] += f" | Holding {qty} @ ${avg:.2f}"
 
         try:
-            # 3. 使用 **plot_kwargs 解包参数传给 plot
             fig, ax = mpf.plot(df, **plot_kwargs)
             canvas = FigureCanvasTkAgg(fig, master=self.tab_chart)
             canvas.draw()
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         except Exception as e:
             ttk.Label(self.tab_chart, text=f"绘图渲染错误: {e}").pack(expand=True)
-            print(f"Plot Error: {e}")
+            print(f"Plot Logic Error: {e}")
 
     # ================= 核心修改区域 =================
 
@@ -397,5 +403,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
+
 
 
