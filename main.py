@@ -19,20 +19,20 @@ TRADES_FILE = "trade_history.json"
 class QuantGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("DeepStock 终极量化终端 (RealTime + Charts)")
+        self.root.title("DeepStock V2 - 高频监控 & 深度决策")
         self.root.geometry("1400x900")
         
         self.backend = AlpacaBackend()
         self.ai = DeepSeekAgent()
+        
         self.running = False
         self.symbols_list = []
         self.last_buy_time = {} 
         self.trade_markers = self.load_trade_history()
         
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Treeview", rowheight=30, font=('Arial', 10))
-        
+        # 共享数据缓存，用于UI和后台线程通信
+        self.market_cache = {} # {symbol: {'price': 0, 'pl': 0, 'qty': 0, 'status': '等待'}}
+
         self.setup_ui()
         self.load_settings()
 
@@ -55,7 +55,8 @@ class QuantGUI:
         except: pass
 
     def setup_ui(self):
-        # 1. 配置区
+        # --- UI 部分代码保持不变，直接复用原代码即可 ---
+        # (为了节省篇幅，这里只写关键变化部分，请保留你原来的 setup_ui 内容)
         config_frame = ttk.LabelFrame(self.root, text="🔧 全局配置", padding=10)
         config_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -77,12 +78,10 @@ class QuantGUI:
         row2.pack(fill=tk.X, pady=10)
         ttk.Label(row2, text="列表:").pack(side=tk.LEFT)
         self.entry_symbols = ttk.Entry(row2, width=40)
-        self.entry_symbols.insert(0, "BTC/USD, ETH/USD, NVDA")
         self.entry_symbols.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(row2, text="单笔($):").pack(side=tk.LEFT)
         self.entry_qty = ttk.Entry(row2, width=8)
-        self.entry_qty.insert(0, "100")
         self.entry_qty.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(row2, text="K线周期:").pack(side=tk.LEFT)
@@ -93,7 +92,6 @@ class QuantGUI:
         self.btn_start = ttk.Button(row2, text="▶ 启动", state="disabled", command=self.toggle_trading)
         self.btn_start.pack(side=tk.RIGHT, padx=5)
 
-        # 2. 中间多标签
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
@@ -112,7 +110,6 @@ class QuantGUI:
         self.lbl_chart_hint = ttk.Label(self.tab_chart, text="双击列表查看图表", font=("Arial", 14))
         self.lbl_chart_hint.pack(expand=True)
 
-        # 3. 日志
         paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashrelief=tk.RAISED)
         paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         frame_sys = ttk.LabelFrame(paned, text="🖥️ 交易日志")
@@ -121,57 +118,14 @@ class QuantGUI:
         self.txt_sys.tag_config("BUY", foreground="green", font=("Arial", 10, "bold"))
         self.txt_sys.tag_config("SELL", foreground="red", font=("Arial", 10, "bold"))
         self.txt_sys.tag_config("ERR", foreground="red", background="yellow")
+        self.txt_sys.tag_config("WARN", foreground="orange", font=("Arial", 10, "bold"))
         paned.add(frame_sys)
         frame_ai = ttk.LabelFrame(paned, text="🧠 AI 思考")
         self.txt_ai = scrolledtext.ScrolledText(frame_ai, width=50, height=12, state='disabled', bg="#fffde7")
         self.txt_ai.pack(fill=tk.BOTH, expand=True)
         paned.add(frame_ai)
 
-    # --- 绘图逻辑 ---
-    def on_tree_double_click(self, event):
-        item = self.tree.selection()[0]
-        symbol = self.tree.item(item, "values")[0]
-        self.notebook.select(self.tab_chart)
-        self.plot_chart(symbol)
-
-    def plot_chart(self, symbol):
-        for widget in self.tab_chart.winfo_children(): widget.destroy()
-        
-        tf = self.combo_tf.get()
-        df = self.backend.get_chart_data(symbol, tf)
-        if df is None:
-            ttk.Label(self.tab_chart, text="无法获取K线数据").pack(expand=True)
-            return
-
-        add_plots = []
-        if symbol in self.trade_markers:
-            history = self.trade_markers[symbol]
-            buys = [float('nan')] * len(df)
-            sells = [float('nan')] * len(df)
-            
-            for trade in history:
-                try:
-                    t_time = pd.to_datetime(trade['time'])
-                    idx = df.index.get_indexer([t_time], method='nearest')[0]
-                    if trade['action'] == 'BUY': buys[idx] = trade['price'] * 0.99
-                    elif trade['action'] == 'SELL': sells[idx] = trade['price'] * 1.01
-                except: pass
-            
-            if any(not pd.isna(x) for x in buys):
-                add_plots.append(mpf.make_addplot(buys, type='scatter', markersize=100, marker='^', color='g'))
-            if any(not pd.isna(x) for x in sells):
-                add_plots.append(mpf.make_addplot(sells, type='scatter', markersize=100, marker='v', color='r'))
-
-        try:
-            s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True))
-            fig, ax = mpf.plot(df, type='candle', mav=(5,10), volume=True, style=s, addplot=add_plots, returnfig=True, figsize=(10,6), title=f"{symbol} ({tf})")
-            canvas = FigureCanvasTkAgg(fig, master=self.tab_chart)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        except Exception as e:
-            ttk.Label(self.tab_chart, text=f"绘图错误: {e}").pack(expand=True)
-
-    # --- 常规功能 ---
+    # ... save_settings, load_settings, log_sys, log_ai, connect_alpaca 保持不变 ...
     def save_settings(self):
         data = {"api_key": self.entry_key.get(), "api_secret": self.entry_secret.get(), "symbols": self.entry_symbols.get(), "qty": self.entry_qty.get()}
         try:
@@ -215,64 +169,150 @@ class QuantGUI:
             self.save_settings()
         else: self.log_sys(msg, "ERR")
 
+    def on_tree_double_click(self, event):
+        item = self.tree.selection()[0]
+        symbol = self.tree.item(item, "values")[0]
+        self.notebook.select(self.tab_chart)
+        self.plot_chart(symbol)
+
+    def plot_chart(self, symbol):
+        for widget in self.tab_chart.winfo_children(): widget.destroy()
+        tf = self.combo_tf.get()
+        df = self.backend.get_chart_data(symbol, tf)
+        if df is None:
+            ttk.Label(self.tab_chart, text="无法获取K线数据").pack(expand=True)
+            return
+        add_plots = []
+        if symbol in self.trade_markers:
+            history = self.trade_markers[symbol]
+            buys = [float('nan')] * len(df)
+            sells = [float('nan')] * len(df)
+            for trade in history:
+                try:
+                    t_time = pd.to_datetime(trade['time'])
+                    idx = df.index.get_indexer([t_time], method='nearest')[0]
+                    if trade['action'] == 'BUY': buys[idx] = trade['price'] * 0.99
+                    elif trade['action'] == 'SELL': sells[idx] = trade['price'] * 1.01
+                except: pass
+            if any(not pd.isna(x) for x in buys):
+                add_plots.append(mpf.make_addplot(buys, type='scatter', markersize=100, marker='^', color='g'))
+            if any(not pd.isna(x) for x in sells):
+                add_plots.append(mpf.make_addplot(sells, type='scatter', markersize=100, marker='v', color='r'))
+        try:
+            s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True))
+            fig, ax = mpf.plot(df, type='candle', mav=(5,10), volume=True, style=s, addplot=add_plots, returnfig=True, figsize=(10,6), title=f"{symbol} ({tf})")
+            canvas = FigureCanvasTkAgg(fig, master=self.tab_chart)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        except Exception as e:
+            ttk.Label(self.tab_chart, text=f"绘图错误: {e}").pack(expand=True)
+
+    # ================= 核心修改区域 =================
+
     def toggle_trading(self):
         if not self.running:
             self.save_settings()
             raw = self.entry_symbols.get()
             self.symbols_list = [s.strip().upper() for s in raw.split(',') if s.strip()]
             if not self.symbols_list: return messagebox.showerror("错误", "交易对为空")
+            
             self.running = True
             self.btn_start.config(text="⏹ 停止")
+            
+            # 初始化 Treeview 和 缓存
             for item in self.tree.get_children(): self.tree.delete(item)
-            for sym in self.symbols_list: self.tree.insert("", "end", iid=sym, values=(sym, "...", "0", "0", "0", "等待", "--"))
-            threading.Thread(target=self.multi_symbol_loop, daemon=True).start()
-            self.log_sys(f"🚀 启动: {self.symbols_list}")
+            for sym in self.symbols_list: 
+                self.tree.insert("", "end", iid=sym, values=(sym, "...", "0", "0", "0", "等待", "--"))
+                self.market_cache[sym] = {'price': 0, 'qty': 0, 'avg': 0, 'pl': 0, 'status': '初始化'}
+
+            self.log_sys(f"🚀 启动双线程系统: {self.symbols_list}")
+            
+            # 🧵 线程 1: 极速行情刷新 (每 1 秒)
+            threading.Thread(target=self.monitor_prices_loop, daemon=True).start()
+            
+            # 🧵 线程 2: AI 策略分析 (每 60 秒)
+            threading.Thread(target=self.strategy_loop, daemon=True).start()
         else:
             self.running = False
             self.btn_start.config(text="▶ 启动")
             self.log_sys("🛑 停止中...")
 
-    def update_tree_row(self, symbol, price, qty, avg, pl, status, cd):
-        if self.tree.exists(symbol):
-            self.tree.item(symbol, values=(symbol, f"${price:,.2f}", f"{qty:.4f}", f"${avg:,.2f}", f"${pl:+.2f}", status, cd))
+    def update_ui_safe(self, symbol):
+        """线程安全的 UI 更新函数"""
+        if not self.running or symbol not in self.market_cache: return
+        data = self.market_cache[symbol]
+        
+        # 计算冷却倒计时显示
+        last = self.last_buy_time.get(symbol, 0)
+        rem = max(0, 300 - (time.time() - last))
+        cd_text = f"{int(rem)}s" if rem > 0 else "就绪"
 
-    def multi_symbol_loop(self):
+        if self.tree.exists(symbol):
+            self.tree.item(symbol, values=(
+                symbol, 
+                f"${data['price']:,.2f}", 
+                f"{data['qty']:.4f}", 
+                f"${data['avg']:,.2f}", 
+                f"${data['pl']:+.2f}", 
+                data['status'], 
+                cd_text
+            ))
+
+    def monitor_prices_loop(self):
+        """【线程1】只负责更新价格和盈亏，不进行思考"""
         while self.running:
             for symbol in self.symbols_list:
                 if not self.running: break
-                success = False
-                msg = ""
                 try:
-                    last = self.last_buy_time.get(symbol, 0)
-                    rem = max(0, 300 - (time.time() - last))
-                    cd_text = f"{int(rem)}s" if rem > 0 else "就绪"
-
-                    self.root.after(0, lambda s=symbol: self.update_tree_row(s, 0, 0, 0, 0, "数据...", cd_text))
+                    # 1. 快速获取价格
+                    price = self.backend.get_latest_price_fast(symbol)
+                    if price > 0:
+                        # 2. 更新缓存
+                        cache = self.market_cache[symbol]
+                        cache['price'] = price
+                        
+                        # 如果有持仓，实时计算盈亏
+                        if cache['qty'] > 0:
+                            cache['pl'] = (price - cache['avg']) * cache['qty']
+                        
+                        # 3. 刷新 UI
+                        self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
                     
-                    price, report = self.backend.get_market_data_detailed(symbol)
-                    if price == 0:
-                        self.log_sys(f"{symbol} 失败", "ERR")
-                        continue
+                except Exception as e:
+                    print(f"Price Monitor Error {symbol}: {e}")
+            
+            time.sleep(1.5) # 高频刷新，但不至于卡死API
 
-                    pos_qty, _, pos_avg = self.backend.get_position(symbol)
+    def strategy_loop(self):
+        """【线程2】负责重型任务：拉K线、AI思考、下单"""
+        while self.running:
+            self.log_sys("🔍 AI 开始新一轮全量扫描...")
+            
+            for symbol in self.symbols_list:
+                if not self.running: break
+                
+                try:
+                    # 更新状态显示
+                    self.market_cache[symbol]['status'] = "分析中..."
+                    self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
+
+                    # 1. 获取详细数据 (含指标)
+                    price, report = self.backend.get_analysis_data(symbol)
                     
-                    if pos_qty > 0 and price > 0:
-                        pos_pl = (price - pos_avg) * pos_qty
-                    else:
-                        pos_pl = 0.0
+                    # 同步一下持仓信息
+                    qty, pl, avg = self.backend.get_position(symbol)
+                    self.market_cache[symbol].update({'qty': qty, 'avg': avg}) # 价格由另一个线程更新，这里只更新持仓
 
-                    self.root.after(0, lambda s=symbol, p=price, q=pos_qty, a=pos_avg, pl=pos_pl, c=cd_text: 
-                        self.update_tree_row(s, p, q, a, pl, "AI...", c))
-
-                    # 注意：这里我们写死模型名，或者你可以加回 entry_model
-                    action, reason, thought = self.ai.analyze("deepseek-r1:8b", symbol, price, report, pos_qty, pos_avg)
+                    # 2. 调用 AI (这里会阻塞很久，但不会影响 UI 价格刷新!)
+                    action, reason, thought = self.ai.analyze("deepseek-r1:8b", symbol, price, report, qty, avg)
+                    
                     self.log_ai(symbol, thought, action, reason)
+                    self.market_cache[symbol]['status'] = action # 更新状态
+                    self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
 
-                    self.root.after(0, lambda s=symbol, p=price, q=pos_qty, a=pos_avg, pl=pos_pl, act=action, c=cd_text: 
-                        self.update_tree_row(s, p, q, a, pl, act, c))
-
+                    # 3. 执行交易
                     if action == "BUY":
-                        if pos_qty == 0:
+                        if qty == 0:
                             success, msg = self.backend.place_order(symbol, "buy", float(self.entry_qty.get()), price)
                             tag = "BUY" if success else "ERR"
                             self.log_sys(f"[{symbol}] 买入: {msg}", tag)
@@ -281,30 +321,29 @@ class QuantGUI:
                                 self.record_trade(symbol, 'BUY', price)
                         else:
                             self.log_sys(f"[{symbol}] 持有中，跳过")
-                            
+
                     elif action == "SELL":
-                        if pos_qty > 0:
-                            if rem > 0:
-                                self.log_sys(f"[{symbol}] 冷却保护中", "WARN")
+                        if qty > 0:
+                            # 冷却检查
+                            last = self.last_buy_time.get(symbol, 0)
+                            if time.time() - last < 300: # 5分钟保护
+                                self.log_sys(f"[{symbol}] 冷却保护中 (5min)", "WARN")
                             else:
                                 success, msg = self.backend.close_full_position(symbol)
                                 tag = "SELL" if success else "ERR"
                                 self.log_sys(f"[{symbol}] 卖出: {msg}", tag)
                                 if success:
                                     self.record_trade(symbol, 'SELL', price)
-                        else:
-                            self.log_sys(f"[{symbol}] 无持仓")
-
-                    for _ in range(2): 
-                        if not self.running: break
-                        time.sleep(1)
+                                    self.market_cache[symbol]['qty'] = 0 # 立即重置本地缓存
 
                 except Exception as e:
-                    self.log_sys(f"{symbol} 错误: {e}", "ERR")
+                    self.log_sys(f"Strategy Error {symbol}: {e}", "ERR")
             
-            if self.running:
-                self.log_sys("💤 休息 10 秒...")
-                time.sleep(10)
+            # 这里的休息时间决定了 AI 的频率，建议 60秒
+            self.log_sys("⏳ 周期结束，等待 60 秒...")
+            for _ in range(60):
+                if not self.running: break
+                time.sleep(1)
 
 if __name__ == "__main__":
     root = tk.Tk()
