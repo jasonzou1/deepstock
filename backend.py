@@ -2,7 +2,7 @@ import alpaca_trade_api as tradeapi
 import pandas as pd
 import pandas_ta as ta
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 class AlpacaBackend:
     def __init__(self):
@@ -26,36 +26,30 @@ class AlpacaBackend:
 
     def get_latest_price_fast(self, symbol):
         """
-        ⚡️【极速通道 - HTTP 修复版】
-        直接请求 API，修复了符号格式问题，并增加了详细的错误打印
+        ⚡️【极速通道 - HTTP 稳健版】
+        直接请求 API 获取最新成交价，解决 Crypto 价格有时为 0 的问题
         """
         if not self.connected: return 0.0
 
         try:
             # --- 1. 加密货币 (带 / ) ---
             if "/" in symbol:
-                # 🔴 关键修复：Alpaca API v1beta3 要求符号必须带 / (例如 BTC/USD)
-                # 之前代码里的 .replace("/", "") 是导致获取不到数据的罪魁祸首
-                
-                # 直接构造 URL，requests 库会自动处理 URL 编码
+                # Alpaca v1beta3 Data API (必须带 /，例如 BTC/USD)
                 url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/trades"
-                params = {"symbols": symbol} # 这里传 "BTC/USD"
+                params = {"symbols": symbol}
                 
-                # 发送请求
                 resp = requests.get(url, params=params, headers=self.headers, timeout=2)
                 
                 if resp.status_code == 200:
                     data = resp.json()
-                    # 调试打印：让你看到服务器到底返回了什么
-                    # print(f"DEBUG {symbol}: {data}") 
-                    
                     if "trades" in data and symbol in data["trades"]:
                         price = float(data["trades"][symbol]["p"])
                         if price > 0: return price
                     else:
-                        print(f"⚠️ {symbol} 数据为空，API返回: {data}")
+                        # 偶尔数据为空时，不打印烦人的日志，直接返回0让上层处理
+                        pass
                 else:
-                    print(f"❌ {symbol} HTTP请求失败: {resp.status_code} - {resp.text}")
+                    print(f"❌ {symbol} HTTP请求失败: {resp.status_code}")
 
             # --- 2. 股票 (不带 / ) ---
             else:
@@ -70,22 +64,25 @@ class AlpacaBackend:
 
     def get_analysis_data(self, symbol):
         """
-        🐢【分析通道 - 升级版】
-        不仅计算指标，还提取最近的 K 线形态喂给 AI
+        🐢【分析通道 - AI 专用】
+        获取 K 线 + 计算指标 + 提取近期形态
         """
         if not self.connected: return 0, "No Connection"
         
         try:
-            # 1. 获取 K 线 (保持不变)
-            limit = 100
+            # 1. 强制获取最近的数据 (防止 AI 分析旧数据)
+            now_utc = datetime.now(timezone.utc)
+            start_time = (now_utc - timedelta(hours=4)).isoformat() # 只看最近4小时足够了
+            limit = 200 
+
             if "/" in symbol:
-                bars = self.api.get_crypto_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit).df
+                bars = self.api.get_crypto_bars(symbol, tradeapi.TimeFrame.Minute, start=start_time, limit=limit).df
             else:
-                bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit).df
+                bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, start=start_time, limit=limit).df
 
             if bars.empty: return 0, "No Data"
 
-            # 2. 清洗数据 (保持不变)
+            # 2. 清洗数据
             df = bars.copy()
             map_cols = {'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}
             df.rename(columns=map_cols, inplace=True)
@@ -93,7 +90,7 @@ class AlpacaBackend:
 
             current_price = float(df.iloc[-1]['close'])
 
-            # 3. 计算指标 (保持不变)
+            # 3. 计算指标
             df.ta.rsi(length=14, append=True)
             df.ta.macd(fast=12, slow=26, signal=9, append=True)
             df.ta.bbands(length=20, std=2, append=True)
@@ -101,17 +98,16 @@ class AlpacaBackend:
 
             latest = df.iloc[-1]
             
-            # 🔥 4. 【核心升级】构建“近期 K 线形态数据”
-            # 取最近 15 根 K 线，格式化成文本，让 AI 能“看”到走势
+            # 4. 构建“近期 K 线形态数据” (给 AI 的眼睛)
+            # 取最近 15 根 K 线
             recent_candles = df.tail(15)
             candles_str = "Time (UTC)        | Open   | High   | Low    | Close  | Vol\n"
             candles_str += "-" * 60 + "\n"
             for index, row in recent_candles.iterrows():
-                # 简化时间显示
                 t_str = index.strftime("%H:%M")
-                candles_str += f"{t_str} | {row['open']:.2f} | {row['high']:.2f} | {row['low']:.2f} | {row['close']:.2f} | {int(row['volume'])}\n"
+                candles_str += f"{t_str} | {row['open']:.2f} | {row['high']:.2f} | {row['low']:.2f} | {row['close']:.2f} | {float(row['volume']):.4f}\n"
 
-            # 5. 生成综合报告
+            # 5. 生成报告
             trend_str = "BULLISH" if current_price > latest.get('SMA_20', 0) else "BEARISH"
             
             report = f"*** MARKET DATA ***\n"
@@ -131,8 +127,54 @@ class AlpacaBackend:
         except Exception as e:
             return 0, f"Error: {str(e)}"
 
+    def get_chart_data(self, symbol, timeframe_str="1Min"):
+        """
+        📊【绘图通道 - 强制刷新版】
+        核心修复：强制指定 start 时间，确保 K 线图永远是最新的
+        """
+        if not self.connected: return None
+        try:
+            # 1. 动态计算 start 时间 (向 API 要最新的数据)
+            now_utc = datetime.now(timezone.utc)
+            
+            if timeframe_str == "5Min": 
+                tf = tradeapi.TimeFrame(5, tradeapi.TimeFrameUnit.Minute)
+                # 5分钟图：取最近 5 天
+                start_time = (now_utc - timedelta(days=5)).isoformat()
+            elif timeframe_str == "15Min": 
+                tf = tradeapi.TimeFrame(15, tradeapi.TimeFrameUnit.Minute)
+                start_time = (now_utc - timedelta(days=10)).isoformat()
+            elif timeframe_str == "1Hour": 
+                tf = tradeapi.TimeFrame.Hour
+                start_time = (now_utc - timedelta(days=40)).isoformat()
+            else:
+                # 默认 1Min：取最近 24 小时
+                tf = tradeapi.TimeFrame.Minute
+                start_time = (now_utc - timedelta(hours=24)).isoformat()
+            
+            limit = 3000 # 获取足够多的 K 线以保证连贯
+            
+            # 2. 调用 API (带 start 参数)
+            if "/" in symbol:
+                bars = self.api.get_crypto_bars(symbol, tf, start=start_time, limit=limit).df
+            else:
+                bars = self.api.get_bars(symbol, tf, start=start_time, limit=limit).df
+                
+            if bars.empty: return None
+            
+            # 3. 清洗数据
+            df = bars.copy()
+            map_cols = {'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}
+            df.rename(columns=map_cols, inplace=True)
+            df.index = pd.to_datetime(df.index)
+            
+            return df
+        except Exception as e:
+            print(f"Chart Data Error: {e}")
+            return None
+
     def get_position(self, symbol):
-        # ... (保留原代码，这里直接复制你的原逻辑即可) ...
+        """查询持仓 (通用)"""
         if not self.connected: return 0, 0, 0
         try:
             all_positions = self.api.list_positions()
@@ -145,7 +187,7 @@ class AlpacaBackend:
         except: return 0, 0, 0
 
     def place_order(self, symbol, side, qty_usd, current_price):
-        # ... (保留原代码) ...
+        """下单"""
         if not self.connected: return False, "未连接"
         try:
             qty_usd = round(float(qty_usd), 2)
@@ -155,11 +197,13 @@ class AlpacaBackend:
         except Exception as e: return False, str(e)
 
     def close_full_position(self, symbol):
-        # ... (保留原代码) ...
+        """清仓"""
         if not self.connected: return False, "未连接"
         try:
             qty, _, _ = self.get_position(symbol)
             if qty <= 0: return False, "无持仓"
+            
+            # 寻找真实 symbol (如 BTCUSD)
             real_symbol = symbol
             all_positions = self.api.list_positions()
             target_clean = symbol.replace("/", "").strip().upper()
@@ -167,33 +211,10 @@ class AlpacaBackend:
                 if pos.symbol.replace("/", "").strip().upper() == target_clean:
                     real_symbol = pos.symbol
                     break
+            
             self.api.submit_order(symbol=real_symbol, qty=qty, side='sell', type='market', time_in_force='gtc')
             return True, f"已清仓卖出 {qty}"
         except Exception as e: return False, str(e)
-    
-    # 为了防止上面的 get_chart_data 报错，这里补全它
-    def get_chart_data(self, symbol, timeframe_str="1Min"):
-        if not self.connected: return None
-        try:
-            tf = tradeapi.TimeFrame.Minute
-            if timeframe_str == "5Min": tf = tradeapi.TimeFrame(5, tradeapi.TimeFrameUnit.Minute)
-            elif timeframe_str == "15Min": tf = tradeapi.TimeFrame(15, tradeapi.TimeFrameUnit.Minute)
-            elif timeframe_str == "1Hour": tf = tradeapi.TimeFrame.Hour
-            
-            # 🔥 关键修复 2：把 limit 改大到 1000
-            limit = 1000 
-            
-            if "/" in symbol:
-                bars = self.api.get_crypto_bars(symbol, tf, limit=limit).df
-            else:
-                bars = self.api.get_bars(symbol, tf, limit=limit).df
-            if bars.empty: return None
-            df = bars.copy()
-            map_cols = {'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}
-            df.rename(columns=map_cols, inplace=True)
-            df.index = pd.to_datetime(df.index)
-            return df
-        except: return None
 
 
 
