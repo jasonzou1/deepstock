@@ -129,32 +129,27 @@ class AlpacaBackend:
 
     def get_chart_data(self, symbol, timeframe_str="1Min"):
         """
-        📊【绘图通道 - 强制刷新版】
-        核心修复：强制指定 start 时间，确保 K 线图永远是最新的
+        📊【绘图通道 - 性能优化版】
         """
         if not self.connected: return None
         try:
-            # 1. 动态计算 start 时间 (向 API 要最新的数据)
             now_utc = datetime.now(timezone.utc)
             
+            # 动态调整时间范围，不要拉太久远的数据，否则前端会卡死
             if timeframe_str == "5Min": 
                 tf = tradeapi.TimeFrame(5, tradeapi.TimeFrameUnit.Minute)
-                # 5分钟图：取最近 5 天
-                start_time = (now_utc - timedelta(days=5)).isoformat()
+                start_time = (now_utc - timedelta(days=3)).isoformat() # 缩短到3天
             elif timeframe_str == "15Min": 
                 tf = tradeapi.TimeFrame(15, tradeapi.TimeFrameUnit.Minute)
-                start_time = (now_utc - timedelta(days=10)).isoformat()
-            elif timeframe_str == "1Hour": 
-                tf = tradeapi.TimeFrame.Hour
-                start_time = (now_utc - timedelta(days=40)).isoformat()
+                start_time = (now_utc - timedelta(days=7)).isoformat()
             else:
-                # 默认 1Min：取最近 24 小时
+                # 1Min
                 tf = tradeapi.TimeFrame.Minute
-                start_time = (now_utc - timedelta(hours=24)).isoformat()
+                start_time = (now_utc - timedelta(hours=12)).isoformat() # 缩短到12小时
             
-            limit = 3000 # 获取足够多的 K 线以保证连贯
+            # 🔥 核心优化：从 3000 降到 800，大幅提升渲染速度
+            limit = 800 
             
-            # 2. 调用 API (带 start 参数)
             if "/" in symbol:
                 bars = self.api.get_crypto_bars(symbol, tf, start=start_time, limit=limit).df
             else:
@@ -162,7 +157,6 @@ class AlpacaBackend:
                 
             if bars.empty: return None
             
-            # 3. 清洗数据
             df = bars.copy()
             map_cols = {'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}
             df.rename(columns=map_cols, inplace=True)
@@ -215,6 +209,7 @@ class AlpacaBackend:
             self.api.submit_order(symbol=real_symbol, qty=qty, side='sell', type='market', time_in_force='gtc')
             return True, f"已清仓卖出 {qty}"
         except Exception as e: return False, str(e)
+
 
 
 
