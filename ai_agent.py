@@ -33,39 +33,54 @@ class DeepSeekAgent:
 
         # 3. 提示词 (Prompt)
         prompt = f"""
-        Role: Crypto Strategy Expert (Continuity & Context Aware).
+        Role: Senior Crypto Quant Trader (Specialized in Price Action & Scalping).
         
-        [Current Market]
+        [Context]
         Symbol: {symbol}
-        Price: ${price}
+        Current Price: ${price}
         
         {memory_block}
         
-        [Position]
+        [Position Status]
         {position_status}
         
-        [Technical Brief]
+        [Market Data Input]
         {market_report}
         
         [Instructions]
-        1. REVIEW YOUR LAST DECISION. Do not flip-flop (buy/sell/buy) unless trend drastically changes.
-        2. IF you bought recently and price is slightly down, HOLD (give it room to breathe).
-        3. IF holding and profit > 2%, consider SELL (take profit).
-        4. IF holding and trend breaks SMA20 support, SELL (stop loss).
+        1. FIRST, analyze the "RECENT 15 MIN PRICE ACTION" table deeply.
+           - Look for patterns: Doji, Hammer, Engulfing, higher-highs/lower-lows.
+           - Check volume spikes.
+        2. Combine with Indicators (RSI, MACD, SMA20).
+           - Is RSI diverging from the price action in the table?
+        3. Decide Strategy:
+           - BUY: Trend is strong OR clear reversal pattern at support.
+           - SELL: Trend broke OR resistance hit OR profit target reached.
+           - HOLD: Choppy market or waiting for confirmation.
         
-        [Task]
-        Analyze recent data + your past decision. 
-        Output JSON ONLY.
-        Example: {{"action": "HOLD", "reason": "Still waiting for breakout, price consolidated since last check"}}
+        [Output Format]
+        You utilize a Chain-of-Thought process. 
+        First, write your thinking process inside <think> tags.
+        Then, output the JSON decision.
+        
+        Format:
+        <think>
+        (Your deep analysis of the 15 candles, volatility, and setup...)
+        </think>
+        {{
+            "action": "BUY", 
+            "reason": "Bullish engulfing pattern detected on 1m chart with RSI rising"
+        }}
         """
         
         payload = {
             "model": model_name,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.0, "num_ctx": 4096}
+            # 🔥 关键修改：提高温度到 0.6，允许 R1 进行推理探索
+            # num_ctx 保持 4096 以容纳更长的 K 线数据
+            "options": {"temperature": 0.6, "num_ctx": 4096}
         }
-
         try:
             resp = requests.post(self.url, json=payload, timeout=120)
             if resp.status_code == 200:
@@ -95,4 +110,5 @@ class DeepSeekAgent:
             
             return "HOLD", f"API Err {resp.status_code}", ""
         except Exception as e:
+
             return "HOLD", f"Net Err: {str(e)}", ""
