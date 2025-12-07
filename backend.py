@@ -70,13 +70,13 @@ class AlpacaBackend:
 
     def get_analysis_data(self, symbol):
         """
-        🐢【分析通道】获取 K 线 + 计算指标
-        用于 AI 深度思考
+        🐢【分析通道 - 升级版】
+        不仅计算指标，还提取最近的 K 线形态喂给 AI
         """
         if not self.connected: return 0, "No Connection"
         
         try:
-            # 获取 K 线
+            # 1. 获取 K 线 (保持不变)
             limit = 100
             if "/" in symbol:
                 bars = self.api.get_crypto_bars(symbol, tradeapi.TimeFrame.Minute, limit=limit).df
@@ -85,7 +85,7 @@ class AlpacaBackend:
 
             if bars.empty: return 0, "No Data"
 
-            # 清洗数据
+            # 2. 清洗数据 (保持不变)
             df = bars.copy()
             map_cols = {'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}
             df.rename(columns=map_cols, inplace=True)
@@ -93,7 +93,7 @@ class AlpacaBackend:
 
             current_price = float(df.iloc[-1]['close'])
 
-            # 计算指标
+            # 3. 计算指标 (保持不变)
             df.ta.rsi(length=14, append=True)
             df.ta.macd(fast=12, slow=26, signal=9, append=True)
             df.ta.bbands(length=20, std=2, append=True)
@@ -101,24 +101,35 @@ class AlpacaBackend:
 
             latest = df.iloc[-1]
             
-            # 生成报告
+            # 🔥 4. 【核心升级】构建“近期 K 线形态数据”
+            # 取最近 15 根 K 线，格式化成文本，让 AI 能“看”到走势
+            recent_candles = df.tail(15)
+            candles_str = "Time (UTC)        | Open   | High   | Low    | Close  | Vol\n"
+            candles_str += "-" * 60 + "\n"
+            for index, row in recent_candles.iterrows():
+                # 简化时间显示
+                t_str = index.strftime("%H:%M")
+                candles_str += f"{t_str} | {row['open']:.2f} | {row['high']:.2f} | {row['low']:.2f} | {row['close']:.2f} | {int(row['volume'])}\n"
+
+            # 5. 生成综合报告
             trend_str = "BULLISH" if current_price > latest.get('SMA_20', 0) else "BEARISH"
-            report = f"Price: {current_price:.2f}\n"
-            report += f"Trend: {trend_str}\n"
-            report += f"RSI: {latest.get('RSI_14', 50):.2f}\n"
+            
+            report = f"*** MARKET DATA ***\n"
+            report += f"Current Price: {current_price:.2f}\n"
+            report += f"Trend (vs SMA20): {trend_str}\n\n"
+            
+            report += f"*** TECHNICAL INDICATORS (Latest) ***\n"
+            report += f"RSI(14): {latest.get('RSI_14', 50):.2f}\n"
             report += f"MACD: {latest.get('MACD_12_26_9', 0):.2f}\n"
-            report += f"BB: {latest.get('BBL_20_2.0', 0):.2f} / {latest.get('BBU_20_2.0', 0):.2f}"
+            report += f"Bollinger: {latest.get('BBL_20_2.0', 0):.2f} (Low) / {latest.get('BBU_20_2.0', 0):.2f} (High)\n\n"
+            
+            report += f"*** RECENT 15 MIN PRICE ACTION (Must Analyze Patterns) ***\n"
+            report += candles_str
             
             return current_price, report
 
         except Exception as e:
             return 0, f"Error: {str(e)}"
-
-    # ... get_chart_data, get_position, place_order 等保持不变 ...
-    # (由于篇幅限制，这里假设你保留了 backend.py 的其他方法)
-    def get_chart_data(self, symbol, timeframe_str="1Min"):
-        # ... (保留原代码) ...
-        return super().get_chart_data(symbol, timeframe_str) if hasattr(super(), 'get_chart_data') else None
 
     def get_position(self, symbol):
         # ... (保留原代码，这里直接复制你的原逻辑即可) ...
@@ -180,4 +191,5 @@ class AlpacaBackend:
             df.index = pd.to_datetime(df.index)
             return df
         except: return None
+
 
