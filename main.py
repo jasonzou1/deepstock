@@ -276,150 +276,89 @@ class QuantGUI:
         self.notebook.select(self.tab_chart)
         self.plot_chart(symbol)
 
-    def plot_chart(self, symbol):
-        # 0. 视图记忆：在重绘前记录当前的缩放位置
-        saved_xlim = None
-        saved_ylim = None
-        was_at_edge = False
+    def on_scroll(self, event):
+        """鼠标滚轮缩放"""
+        if event.inaxes != self.ax_main: return
         
-        # 如果是同一个币种且图表已存在，保存当前视角
-        if symbol == self.current_chart_symbol and hasattr(self, 'ax_main'):
-            try:
-                saved_xlim = self.ax_main.get_xlim()
-                saved_ylim = self.ax_main.get_ylim()
-                # 检查是否在看最新的K线 (距离右边界小于5根)
-                if self.last_data_len - saved_xlim[1] < 5:
-                    was_at_edge = True
-            except: pass
-
-        self.current_chart_symbol = symbol
-
-        # 1. 清理旧图表
-        for widget in self.tab_chart.winfo_children():
-            widget.destroy()
+        # 获取当前范围
+        x_min, x_max = self.ax_main.get_xlim()
+        x_range = x_max - x_min
         
-        # 2. 获取数据 (Backend 已优化为 800 根)
-        tf = self.combo_tf.get()
-        df = self.backend.get_chart_data(symbol, tf)
-        live_price = self.backend.get_latest_price_fast(symbol)
-
-        if df is None or df.empty:
-            ttk.Label(self.tab_chart, text="正在拉取数据...").pack(expand=True)
-            return
-
-        # 3. 时区转换 (本地时间)
-        if df.index.tz is None: df.index = df.index.tz_localize('UTC')
-        else: df.index = df.index.tz_convert('UTC')
-        my_timezone = datetime.datetime.now().astimezone().tzinfo
-        df.index = df.index.tz_convert(my_timezone)
-
-        # 4. 加载交易记录
-        self.trade_markers = self.load_trade_history()
+        # 确定缩放方向
+        scale_factor = 0.8 if event.button == 'up' else 1.2
         
-        # 5. 绘图风格
-        mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='inherit', wick='inherit', volume='in')
-        s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
+        # 计算新范围 (以鼠标为中心)
+        mouse_rel = (event.xdata - x_min) / x_range
+        new_range = x_range * scale_factor
+        
+        # 限制缩放极限
+        if new_range < 10: new_range = 10 # 最小看10根
+        if new_range > len(self.current_df): new_range = len(self.current_df)
+        
+        new_min = event.xdata - mouse_rel * new_range
+        new_max = new_min + new_range
+        
+        # 边界检查
+        if new_max > len(self.current_df):
+            new_max = len(self.current_df)
+            new_min = new_max - new_range
+        if new_min < 0:
+            new_min = 0
+            new_max = new_range
+            
+        self.ax_main.set_xlim(new_min, new_max)
+        self.fig.canvas.draw_idle()
 
-        # 6. 辅助线 (动态构建，防止空字典报错)
-        hlines_list = []
-        hlines_colors = []
-        qty, pl, avg = self.backend.get_position(symbol)
-        if qty > 0:
-            hlines_list.append(avg)
-            hlines_colors.append('cyan')
-        if live_price > 0:
-            hlines_list.append(live_price)
-            hlines_colors.append('white')
+    def on_press(self, event):
+        """鼠标按下"""
+        if event.inaxes == self.ax_main and event.button == 1:
+            self.is_dragging = True
+            self.last_mouse_x = event.xdata
 
-        plot_kwargs = dict(
-            type='candle',
-            mav=(5, 20),
-            volume=True,
-            style=s,
-            returnfig=True, # 必须返回 figure 以便手动操作
-            figsize=(12, 8),
-            tight_layout=True,
-            ylabel='Price ($)',
-            datetime_format='%m-%d %H:%M',
-            xrotation=0
-        )
-        if hlines_list:
-            plot_kwargs['hlines'] = dict(hlines=hlines_list, colors=hlines_colors, linestyle='--', linewidths=1.0)
+    def on_release(self, event):
+        """鼠标松开"""
+        self.is_dragging = False
+        self.last_mouse_x = None
 
+    def on_drag_and_hover(self, event):
+        """处理拖拽平移 + HUD数据显示"""
+        if not hasattr(self, 'current_df') or self.current_df is None: return
+        if event.inaxes != self.ax_main: return
+
+        # 1. 拖拽平移逻辑
+        if self.is_dragging and self.last_mouse_x is not None and event.xdata is not None:
+            dx = event.xdata - self.last_mouse_x
+            x_min, x_max = self.ax_main.get_xlim()
+            
+            # 计算新位置 (反向移动视角)
+            new_min, new_max = x_min - dx, x_max - dx
+            
+            # 边界检查
+            if new_max > len(self.current_df):
+                diff = new_max - len(self.current_df)
+                new_max -= diff
+                new_min -= diff
+            if new_min < 0:
+                diff = 0 - new_min
+                new_min += diff
+                new_max += diff
+                
+            self.ax_main.set_xlim(new_min, new_max)
+            self.fig.canvas.draw_idle()
+            return # 拖拽时不更新HUD
+
+        # 2. 悬停 HUD 逻辑
         try:
-            # 7. 生成图表
-            self.fig, self.axlist = mpf.plot(df, **plot_kwargs)
-            self.ax_main = self.axlist[0]
-            
-            # --- 绘制 B/S 杆子标记 (Annotate) ---
-            if symbol in self.trade_markers:
-                history = self.trade_markers[symbol]
-                for trade in history:
-                    try:
-                        t_time = pd.to_datetime(trade['time'])
-                        if t_time.tz is None: t_time = t_time.tz_localize('UTC')
-                        else: t_time = t_time.tz_convert('UTC')
-                        t_time_local = t_time.tz_convert(my_timezone)
-
-                        # 范围过滤
-                        if t_time_local < df.index[0] or t_time_local > df.index[-1] + pd.Timedelta(minutes=5): continue
-                        
-                        # 找到对应K线
-                        idx_label = df.index[df.index.get_indexer([t_time_local], method='nearest')[0]]
-                        candle_low = df.loc[idx_label]['low']
-                        candle_high = df.loc[idx_label]['high']
-
-                        # 画杆子
-                        if trade['action'] == 'BUY':
-                            self.ax_main.annotate('B', xy=(idx_label, candle_low), xytext=(0, -20), 
-                                textcoords='offset points', color='white', fontweight='bold', ha='center',
-                                bbox=dict(boxstyle='round,pad=0.2', fc='#00b300', alpha=0.8),
-                                arrowprops=dict(arrowstyle='->', color='#00b300', lw=1.5))
-                        elif trade['action'] == 'SELL':
-                            self.ax_main.annotate('S', xy=(idx_label, candle_high), xytext=(0, 20), 
-                                textcoords='offset points', color='white', fontweight='bold', ha='center',
-                                bbox=dict(boxstyle='round,pad=0.2', fc='#ff3333', alpha=0.8),
-                                arrowprops=dict(arrowstyle='->', color='#ff3333', lw=1.5))
-                    except: pass
-
-            # --- HUD 信息板 ---
-            self.text_artist = self.ax_main.text(
-                0.02, 0.96, "Loading...", transform=self.ax_main.transAxes, 
-                fontsize=10, color='white', verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='black', alpha=0.7)
-            )
-
-            # ==========================================
-            # 🔥 核心：重新绑定交互事件 (缩放/拖拽)
-            # ==========================================
-            self.current_df = df
-            self.fig.canvas.mpl_connect('scroll_event', self.on_scroll)
-            self.fig.canvas.mpl_connect('button_press_event', self.on_press)
-            self.fig.canvas.mpl_connect('button_release_event', self.on_release)
-            self.fig.canvas.mpl_connect('motion_notify_event', self.on_drag_and_hover)
-            self.is_dragging = False
-            self.last_mouse_x = None
-
-            # 8. 显示并恢复视图
-            canvas = FigureCanvasTkAgg(self.fig, master=self.tab_chart)
-            canvas.draw()
-            canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-            # 恢复之前的缩放位置
-            if saved_xlim:
-                current_len = len(df)
-                view_width = saved_xlim[1] - saved_xlim[0]
-                if was_at_edge:
-                    self.ax_main.set_xlim(current_len - view_width, current_len)
-                else:
-                    self.ax_main.set_xlim(saved_xlim)
-                    self.ax_main.set_ylim(saved_ylim)
-            
-            self.last_data_len = len(df)
-            
-        except Exception as e:
-            print(f"Plot Error: {e}")
-            ttk.Label(self.tab_chart, text=f"绘图出错: {e}").pack(expand=True)
+            x_idx = int(round(event.xdata))
+            if 0 <= x_idx < len(self.current_df):
+                bar = self.current_df.iloc[x_idx]
+                info = (f"{self.current_chart_symbol} {bar.name.strftime('%H:%M')}\n"
+                        f"O:{bar['open']:.2f} H:{bar['high']:.2f}\n"
+                        f"L:{bar['low']:.2f} C:{bar['close']:.2f}\n"
+                        f"V:{float(bar['volume']):.4f}")
+                self.text_artist.set_text(info)
+                self.fig.canvas.draw_idle()
+        except: pass
 
     # ================= 交互事件处理函数 =================
 
@@ -674,6 +613,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
+
 
 
 
