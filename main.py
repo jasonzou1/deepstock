@@ -4,6 +4,7 @@ import threading
 import time
 import datetime
 import json
+import numpy as np
 import os
 import pandas as pd
 import mplfinance as mpf
@@ -277,6 +278,12 @@ class QuantGUI:
         self.plot_chart(symbol)
 
     def plot_chart(self, symbol):
+        """
+        [终极版] 绘图函数：
+        1. 样式回归：使用 annotate 绘制“棍子+圆圈+文字” (B/S)。
+        2. 定位修复：使用 Nearest 算法确保标记紧贴最近的 K 线。
+        3. 时区修复：统一使用无时区本地时间，彻底解决不显示问题。
+        """
         # 0. 视图记忆
         saved_xlim = None
         saved_ylim = None
@@ -286,13 +293,14 @@ class QuantGUI:
             try:
                 saved_xlim = self.ax_main.get_xlim()
                 saved_ylim = self.ax_main.get_ylim()
-                if hasattr(self, 'last_data_len') and (self.last_data_len - saved_xlim[1] < 5):
+                # 检查是否在看最新的数据 (差值小于10根K线认为是在看最新)
+                if hasattr(self, 'last_data_len') and (self.last_data_len - saved_xlim[1] < 10):
                     was_at_edge = True
             except: pass
 
         self.current_chart_symbol = symbol
 
-        # 1. 清理
+        # 1. 清理旧图表
         for widget in self.tab_chart.winfo_children(): widget.destroy()
         
         # 2. 获取数据
@@ -301,106 +309,142 @@ class QuantGUI:
         live_price = self.backend.get_latest_price_fast(symbol)
 
         if df is None or df.empty:
-            ttk.Label(self.tab_chart, text="正在拉取最新数据...").pack(expand=True)
+            ttk.Label(self.tab_chart, text="正在拉取数据...").pack(expand=True)
             return
 
         # ==========================================
-        # 🔥 核心修复 1：统一转换为本地时间，并剥离时区信息 (tz-naive)
+        # 🔥 核心逻辑：统一时间轴为【无时区的本地时间】
         # ==========================================
         # 1. 先确保 df 是 UTC
-        if df.index.tz is None: df.index = df.index.tz_localize('UTC')
-        else: df.index = df.index.tz_convert('UTC')
+        if df.index.tz is None: 
+            df.index = df.index.tz_localize('UTC')
+        else: 
+            df.index = df.index.tz_convert('UTC')
         
-        # 2. 转为本地时间
+        # 2. 转为本地时间并剥离时区 (Naive Local)
         my_timezone = datetime.datetime.now().astimezone().tzinfo
-        df.index = df.index.tz_convert(my_timezone)
-        
-        # 3. 🔥 剥离时区！变成纯粹的 "2023-12-07 16:22:00"
-        # 这样后续比对时，绝对不会因为时区格式不同而失败
-        df.index = df.index.tz_localize(None)
+        df.index = df.index.tz_convert(my_timezone).tz_localize(None)
 
-        # 4. 计算对齐频率
-        freq_map = {"1Min": "1min", "5Min": "5min", "15Min": "15min", "1Hour": "1h"}
-        pd_freq = freq_map.get(tf_raw, "1min")
-
-        # 5. 加载交易记录
+        # 3. 重新加载交易记录
         self.trade_markers = self.load_trade_history()
         
-        # 6. 绘图风格
+        # 4. 绘图风格
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='inherit', wick='inherit', volume='in')
         s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
 
-        # 7. 辅助线
-        hlines_list = []
-        hlines_colors = []
+        # --- (A) 准备辅助线 (Hold均价 & 现价) ---
+        # 使用 hlines 绘制水平线
         qty, pl, avg = self.backend.get_position(symbol)
+        
+        hlines_dict = None
+        hl_vals = []
+        hl_cols = []
+        
         if qty > 0:
-            hlines_list.append(avg)
-            hlines_colors.append('cyan')
+            hl_vals.append(avg)
+            hl_cols.append('cyan') # 持仓均价线颜色
         if live_price > 0:
-            hlines_list.append(live_price)
-            hlines_colors.append('white')
+            hl_vals.append(live_price)
+            hl_cols.append('white') # 现价线颜色
+            
+        if hl_vals:
+            hlines_dict = dict(hlines=hl_vals, colors=hl_cols, linestyle='--', linewidths=1.0)
 
+        # --- (B) 准备标注数据 (不使用 addplot，改用列表暂存) ---
+        # 我们这里只计算位置，具体的画图放到 mpf.plot 之后
+        annotations = []
+        
+        if symbol in self.trade_markers:
+            history = self.trade_markers[symbol]
+            for trade in history:
+                try:
+                    # 1. 解析时间 -> UTC -> 本地 -> 无时区
+                    t_time = pd.to_datetime(trade['time'])
+                    if t_time.tz is None: t_time = t_time.tz_localize('UTC')
+                    else: t_time = t_time.tz_convert('UTC')
+                    
+                    t_naive = t_time.tz_convert(my_timezone).tz_localize(None)
+                    
+                    # 2. 过滤范围 (允许5分钟误差)
+                    if t_naive < df.index[0] or t_naive > df.index[-1] + pd.Timedelta(minutes=5):
+                        continue
+                        
+                    # 3. 🔥 寻找最近的 K 线索引 (整数坐标)
+                    # MPLFinance 的 X 轴本质上是 0, 1, 2... 的整数序列
+                    idx = df.index.get_indexer([t_naive], method='nearest')[0]
+                    
+                    # 4. 记录标注信息
+                    if trade['action'] == 'BUY':
+                        # 记录：(x坐标, y坐标(最低价), 类型)
+                        annotations.append({
+                            'x': idx, 
+                            'y': df.iloc[idx]['low'], 
+                            'type': 'BUY'
+                        })
+                    elif trade['action'] == 'SELL':
+                        # 记录：(x坐标, y坐标(最高价), 类型)
+                        annotations.append({
+                            'x': idx, 
+                            'y': df.iloc[idx]['high'], 
+                            'type': 'SELL'
+                        })
+                except Exception as e:
+                    pass
+
+        # 5. 配置绘图参数
         plot_kwargs = dict(
-            type='candle', mav=(5, 20), volume=True, style=s, returnfig=True,
-            figsize=(12, 8), tight_layout=True, ylabel='Price ($)',
-            datetime_format='%m-%d %H:%M', xrotation=0
+            type='candle', 
+            mav=(5, 20), 
+            volume=True, 
+            style=s, 
+            returnfig=True,
+            figsize=(12, 8), 
+            tight_layout=True, 
+            ylabel='Price ($)',
+            datetime_format='%m-%d %H:%M', 
+            xrotation=0
+            # 注意：这里不再使用 addplot 画买卖点
         )
-        if hlines_list:
-            plot_kwargs['hlines'] = dict(hlines=hlines_list, colors=hlines_colors, linestyle='--', linewidths=1.0)
+
+        if hlines_dict:
+            plot_kwargs['hlines'] = hlines_dict
 
         try:
-            # 8. 生成图表
+            # 6. 生成图表
             self.fig, self.axlist = mpf.plot(df, **plot_kwargs)
             self.ax_main = self.axlist[0]
-            
-            # ==========================================
-            # 🔥 核心修复 2：交易记录也剥离时区，进行纯时间比对
-            # ==========================================
-            if symbol in self.trade_markers:
-                history = self.trade_markers[symbol]
-                
-                for trade in history:
-                    try:
-                        # A. 解析时间并转为本地
-                        t_time = pd.to_datetime(trade['time'])
-                        if t_time.tz is None: t_time = t_time.tz_localize('UTC')
-                        else: t_time = t_time.tz_convert('UTC')
-                        
-                        t_time_local = t_time.tz_convert(my_timezone)
-                        
-                        # B. 🔥 剥离时区 (tz_localize(None))
-                        t_naive = t_time_local.tz_localize(None)
 
-                        # C. 地板除对齐 (16:22:52 -> 16:22:00)
-                        t_floored = t_naive.floor(pd_freq)
+            # 7. 🔥 核心：手动绘制 "棍子+圆圈+文字" 标注
+            for note in annotations:
+                if note['type'] == 'BUY':
+                    # 买入：绿色圆圈 B，位于 K 线下方，箭头向上指
+                    self.ax_main.annotate(
+                        'B', 
+                        xy=(note['x'], note['y']),          # 箭头尖端 (K线低点)
+                        xytext=(0, -25),                    # 文字位置 (向下偏移25点)
+                        textcoords='offset points', 
+                        color='white', 
+                        fontweight='bold', 
+                        ha='center', va='center',
+                        bbox=dict(boxstyle='circle', fc='#00b300', ec='none', alpha=0.9), # 绿色圆圈
+                        arrowprops=dict(arrowstyle='-', color='#00b300', lw=1.5)         # 绿色棍子
+                    )
+                elif note['type'] == 'SELL':
+                    # 卖出：红色圆圈 S，位于 K 线上方，箭头向下指
+                    self.ax_main.annotate(
+                        'S', 
+                        xy=(note['x'], note['y']),          # 箭头尖端 (K线高点)
+                        xytext=(0, 25),                     # 文字位置 (向上偏移25点)
+                        textcoords='offset points', 
+                        color='white', 
+                        fontweight='bold', 
+                        ha='center', va='center',
+                        bbox=dict(boxstyle='circle', fc='#ff3333', ec='none', alpha=0.9), # 红色圆圈
+                        arrowprops=dict(arrowstyle='-', color='#ff3333', lw=1.5)         # 红色棍子
+                    )
 
-                        # D. 核心判断：纯时间比对
-                        if t_floored in df.index:
-                            idx_label = t_floored
-                            
-                            # 获取坐标
-                            candle_low = df.loc[idx_label]['low']
-                            candle_high = df.loc[idx_label]['high']
-
-                            # E. 绘制杆子
-                            if trade['action'] == 'BUY':
-                                self.ax_main.annotate('B', xy=(idx_label, candle_low), xytext=(0, -20), 
-                                    textcoords='offset points', color='white', fontweight='bold', ha='center',
-                                    bbox=dict(boxstyle='round,pad=0.2', fc='#00b300', alpha=0.8),
-                                    arrowprops=dict(arrowstyle='->', color='#00b300', lw=1.5))
-                            elif trade['action'] == 'SELL':
-                                self.ax_main.annotate('S', xy=(idx_label, candle_high), xytext=(0, 20), 
-                                    textcoords='offset points', color='white', fontweight='bold', ha='center',
-                                    bbox=dict(boxstyle='round,pad=0.2', fc='#ff3333', alpha=0.8),
-                                    arrowprops=dict(arrowstyle='->', color='#ff3333', lw=1.5))
-                    except Exception as e:
-                        # print(f"Marker Error: {e}")
-                        pass
-
-            # --- HUD ---
+            # --- HUD (左上角信息) ---
             last_bar = df.iloc[-1]
-            # 因为剥离了时区，这里直接格式化
             t_str = last_bar.name.strftime('%Y-%m-%d %H:%M')
             initial_text = (
                 f"{symbol} [{tf_raw}] {t_str}\n"
@@ -414,7 +458,7 @@ class QuantGUI:
                 bbox=dict(boxstyle='round', facecolor='black', alpha=0.7)
             )
             
-            # 交互事件
+            # 8. 绑定交互
             self.current_df = df
             self.fig.canvas.mpl_connect('scroll_event', self.on_scroll)
             self.fig.canvas.mpl_connect('button_press_event', self.on_press)
@@ -423,12 +467,12 @@ class QuantGUI:
             self.is_dragging = False
             self.last_mouse_x = None
 
-            # 8. 显示
+            # 9. 显示
             canvas = FigureCanvasTkAgg(self.fig, master=self.tab_chart)
             canvas.draw()
             canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-            # 恢复视角
+            # 10. 恢复视角
             if saved_xlim:
                 current_len = len(df)
                 view_width = saved_xlim[1] - saved_xlim[0]
@@ -721,6 +765,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
-
 
 
