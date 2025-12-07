@@ -181,62 +181,79 @@ class QuantGUI:
         self.plot_chart(symbol)
 
     def plot_chart(self, symbol):
-        # 清空旧图表
+        # 1. 清理画布
         for widget in self.tab_chart.winfo_children(): widget.destroy()
         
-        tf = self.combo_tf.get()
-        df = self.backend.get_chart_data(symbol, tf)
+        # 2. 获取并处理数据
+        tf_raw = self.combo_tf.get() # 例如 "1Min", "5Min"
+        df = self.backend.get_chart_data(symbol, tf_raw)
+        
         if df is None or df.empty:
-            ttk.Label(self.tab_chart, text="无法获取K线数据 (可能是休市或网络问题)").pack(expand=True)
+            ttk.Label(self.tab_chart, text="无法获取K线数据 (休市或网络等待)").pack(expand=True)
             return
 
-        # 确保 df 的索引是 UTC 时间
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('UTC')
-        else:
-            df.index = df.index.tz_convert('UTC')
+        # 统一 K 线时间为 UTC
+        if df.index.tz is None: df.index = df.index.tz_localize('UTC')
+        else: df.index = df.index.tz_convert('UTC')
+
+        # 3. 准备 Pandas 频率转换 (用于精准对齐交易时间)
+        # 将界面显示的周期 (1Min) 转换为 pandas 识别的频率 (1min)
+        tf_map = {"1Min": "1min", "5Min": "5min", "15Min": "15min", "1Hour": "1h"}
+        pd_freq = tf_map.get(tf_raw, "1min")
 
         add_plots = []
         
-        # --- 绘制买卖标记 ---
+        # 4. 绘制买卖标记 (精准定位版)
         if symbol in self.trade_markers:
             history = self.trade_markers[symbol]
             buys = [float('nan')] * len(df)
             sells = [float('nan')] * len(df)
             
+            # 用于解决同一根K线多次交易的显示问题
+            # 如果同一分钟买入多次，我们只显示最后一次的价格标记，防止报错
+            
             for trade in history:
                 try:
-                    # 解析交易时间并统一转为 UTC
+                    # A. 解析时间并转 UTC
                     t_time = pd.to_datetime(trade['time'])
                     if t_time.tz is None: t_time = t_time.tz_localize('UTC')
                     else: t_time = t_time.tz_convert('UTC')
-                    
-                    # 过滤掉比当前图表最早时间还早的数据
-                    if t_time < df.index[0]: 
-                        continue
 
-                    # 找到最近的时间点
-                    idx = df.index.get_indexer([t_time], method='nearest')[0]
-                    
-                    # 赋值
-                    if trade['action'] == 'BUY': 
-                        buys[idx] = df.iloc[idx]['low'] * 0.99 
-                    elif trade['action'] == 'SELL': 
-                        sells[idx] = df.iloc[idx]['high'] * 1.01
+                    # B. 【核心升级】时间地板除 (Time Flooring)
+                    # 将 10:05:36 强制对齐到 10:05:00，精准匹配 K 线
+                    t_floored = t_time.floor(pd_freq)
+
+                    # C. 检查是否在当前 K 线范围内
+                    # 如果交易时间比第一根K线还早，跳过
+                    if t_floored < df.index[0]: continue
+                    # 如果交易时间比最后一根K线还晚(且超过一个周期)，说明是脏数据，跳过
+                    if t_floored > df.index[-1] + pd.Timedelta(pd_freq): continue
+
+                    # D. 查找精确索引
+                    if t_floored in df.index:
+                        idx = df.index.get_loc(t_floored)
+                        
+                        # E. 赋值 (Buy在Low下方, Sell在High上方)
+                        if trade['action'] == 'BUY': 
+                            buys[idx] = df.iloc[idx]['low'] * 0.99
+                        elif trade['action'] == 'SELL': 
+                            sells[idx] = df.iloc[idx]['high'] * 1.01
+                            
                 except Exception as e:
-                    print(f"Marker Skip: {e}")
+                    # 忽略偶尔的对齐错误
+                    pass
 
-            # 🔥 修复点：分开检查，防止空数组报错 "zero-size array to reduction"
+            # F. 添加图层 (带空值检查)
             if any(not pd.isna(x) for x in buys):
                 add_plots.append(mpf.make_addplot(buys, type='scatter', markersize=100, marker='^', color='g'))
             
             if any(not pd.isna(x) for x in sells):
                 add_plots.append(mpf.make_addplot(sells, type='scatter', markersize=100, marker='v', color='r'))
 
-        # --- 绘制持仓成本线 & 动态构建参数 ---
+        # 5. 绘制持仓成本线
         qty, pl, avg = self.backend.get_position(symbol)
-        
         s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True))
+        
         plot_kwargs = dict(
             type='candle',
             mav=(5, 10),
@@ -245,7 +262,7 @@ class QuantGUI:
             addplot=add_plots,
             returnfig=True,
             figsize=(10, 6),
-            title=f"{symbol} ({tf})"
+            title=f"{symbol} ({tf_raw})"
         )
 
         if qty > 0:
@@ -403,6 +420,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
+
 
 
 
