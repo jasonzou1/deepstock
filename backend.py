@@ -10,6 +10,28 @@ class AlpacaBackend:
         self.connected = False
         self.headers = {}
 
+    def submit_qty_order(self, symbol, side, qty):
+        """
+        ⚖️【精确下单】按数量下单 (用于减仓或精确加仓)
+        """
+        if not self.connected: return False, "未连接"
+        try:
+            # 确保数量精度，Crypto 通常允许小数，股票通常是整数(除非开启fractional)
+            # 这里简单处理：如果是 Crypto 保留4位小数，股票保留2位
+            qty = float(qty)
+            if qty <= 0: return False, "数量必须大于0"
+
+            self.api.submit_order(
+                symbol=symbol, 
+                qty=qty, 
+                side=side, 
+                type='market', 
+                time_in_force='gtc'
+            )
+            return True, f"精确{side}: {qty}"
+        except Exception as e:
+            return False, str(e)
+
     def connect(self, key, secret, url):
         try:
             self.api = tradeapi.REST(key, secret, url, api_version='v2')
@@ -209,7 +231,5 @@ class AlpacaBackend:
             self.api.submit_order(symbol=real_symbol, qty=qty, side='sell', type='market', time_in_force='gtc')
             return True, f"已清仓卖出 {qty}"
         except Exception as e: return False, str(e)
-
-
 
 
