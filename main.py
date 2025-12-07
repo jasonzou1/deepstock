@@ -191,79 +191,69 @@ class QuantGUI:
             ttk.Label(self.tab_chart, text="无法获取K线数据 (可能是休市或网络问题)").pack(expand=True)
             return
 
-        # 准备绘图样式
-        s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True))
-        add_plots = []
+        # 确保 df 的索引是 UTC 时间 (防止时区混乱)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC')
+        else:
+            df.index = df.index.tz_convert('UTC')
 
-        # 🔥 升级点2：绘制买卖标记 (修复时区匹配问题)
+        add_plots = []
+        
+        # --- 绘制买卖标记 (保持之前的逻辑) ---
         if symbol in self.trade_markers:
             history = self.trade_markers[symbol]
             buys = [float('nan')] * len(df)
             sells = [float('nan')] * len(df)
             
-            # 确保 df.index 是 UTC
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
-            
-            found_marker = False
             for trade in history:
                 try:
-                    # 解析交易时间并转为 UTC
                     t_time = pd.to_datetime(trade['time'])
-                    if t_time.tz is None:
-                        t_time = t_time.tz_localize('UTC')
+                    if t_time.tz is None: t_time = t_time.tz_localize('UTC')
+                    else: t_time = t_time.tz_convert('UTC')
                     
-                    # 过滤掉不在当前 K 线时间范围内的交易
-                    if t_time < df.index[0] or t_time > df.index[-1]:
-                        continue
-                        
-                    # 找到最近的 K 线索引
+                    if t_time < df.index[0] or t_time > df.index[-1]: continue
                     idx = df.index.get_indexer([t_time], method='nearest')[0]
                     
-                    if trade['action'] == 'BUY': 
-                        # 买入标记画在最低价下方 1%
-                        buys[idx] = df.iloc[idx]['low'] * 0.995 
-                        found_marker = True
-                    elif trade['action'] == 'SELL': 
-                        # 卖出标记画在最高价上方 1%
-                        sells[idx] = df.iloc[idx]['high'] * 1.005
-                        found_marker = True
-                except Exception as e: 
-                    print(f"Plot Marker Err: {e}")
+                    if trade['action'] == 'BUY': buys[idx] = df.iloc[idx]['low'] * 0.99 
+                    elif trade['action'] == 'SELL': sells[idx] = df.iloc[idx]['high'] * 1.01
+                except: pass
+            
+            if not pd.isna(buys).all():
+                add_plots.append(mpf.make_addplot(buys, type='scatter', markersize=100, marker='^', color='g'))
+            if not pd.isna(sells).all():
+                add_plots.append(mpf.make_addplot(sells, type='scatter', markersize=100, marker='v', color='r'))
 
-            if found_marker:
-                # 绿色向上三角表示买入，红色向下三角表示卖出
-                add_plots.append(mpf.make_addplot(buys, type='scatter', markersize=100, marker='^', color='green'))
-                add_plots.append(mpf.make_addplot(sells, type='scatter', markersize=100, marker='v', color='red'))
+        # --- 🔥 修复核心：动态构建参数 ---
+        qty, pl, avg = self.backend.get_position(symbol)
+        
+        # 1. 定义基础参数
+        s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True))
+        plot_kwargs = dict(
+            type='candle',
+            mav=(5, 10),
+            volume=True,
+            style=s,
+            addplot=add_plots,
+            returnfig=True,
+            figsize=(10, 6),
+            title=f"{symbol} ({tf})"
+        )
 
-        # 🔥 升级点3：如果当前持有仓位，画出蓝色持仓成本线 (锦上添花!)
-        qty, pl, avg_price = self.backend.get_position(symbol)
-        hlines_dict = dict()
-        if qty > 0 and avg_price > 0:
-            hlines_dict = dict(hlines=[avg_price], colors=['blue'], linestyle='-.', linewidths=(1.5))
-            # 在标题里显示成本价
-            title_txt = f"{symbol} ({tf}) - HOLDING: {qty} @ ${avg_price:.2f}"
-        else:
-            title_txt = f"{symbol} ({tf})"
+        # 2. 只有当有持仓时，才添加 hlines 参数！
+        # 之前就是因为没持仓时传了空字典导致报错
+        if qty > 0:
+            plot_kwargs['hlines'] = dict(hlines=[avg], colors=['blue'], linestyle='-.', linewidths=(1.5))
+            plot_kwargs['title'] += f" | Holding {qty} @ ${avg:.2f}"
 
         try:
-            fig, ax = mpf.plot(
-                df, 
-                type='candle', 
-                mav=(5, 20),      # 增加一根 SMA20 均线，方便看趋势
-                volume=True, 
-                style=s, 
-                addplot=add_plots, 
-                hlines=hlines_dict, # 传入成本线
-                returnfig=True, 
-                figsize=(10,6), 
-                title=title_txt
-            )
+            # 3. 使用 **plot_kwargs 解包参数传给 plot
+            fig, ax = mpf.plot(df, **plot_kwargs)
             canvas = FigureCanvasTkAgg(fig, master=self.tab_chart)
             canvas.draw()
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         except Exception as e:
             ttk.Label(self.tab_chart, text=f"绘图渲染错误: {e}").pack(expand=True)
+            print(f"Plot Error: {e}")
 
     # ================= 核心修改区域 =================
 
@@ -407,4 +397,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
+
 
