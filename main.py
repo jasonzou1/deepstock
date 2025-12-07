@@ -276,89 +276,172 @@ class QuantGUI:
         self.notebook.select(self.tab_chart)
         self.plot_chart(symbol)
 
-    def on_scroll(self, event):
-        """鼠标滚轮缩放"""
-        if event.inaxes != self.ax_main: return
+    def plot_chart(self, symbol):
+        # 0. 视图记忆
+        saved_xlim = None
+        saved_ylim = None
+        was_at_edge = False
         
-        # 获取当前范围
-        x_min, x_max = self.ax_main.get_xlim()
-        x_range = x_max - x_min
-        
-        # 确定缩放方向
-        scale_factor = 0.8 if event.button == 'up' else 1.2
-        
-        # 计算新范围 (以鼠标为中心)
-        mouse_rel = (event.xdata - x_min) / x_range
-        new_range = x_range * scale_factor
-        
-        # 限制缩放极限
-        if new_range < 10: new_range = 10 # 最小看10根
-        if new_range > len(self.current_df): new_range = len(self.current_df)
-        
-        new_min = event.xdata - mouse_rel * new_range
-        new_max = new_min + new_range
-        
-        # 边界检查
-        if new_max > len(self.current_df):
-            new_max = len(self.current_df)
-            new_min = new_max - new_range
-        if new_min < 0:
-            new_min = 0
-            new_max = new_range
-            
-        self.ax_main.set_xlim(new_min, new_max)
-        self.fig.canvas.draw_idle()
+        if symbol == self.current_chart_symbol and hasattr(self, 'ax_main'):
+            try:
+                saved_xlim = self.ax_main.get_xlim()
+                saved_ylim = self.ax_main.get_ylim()
+                if hasattr(self, 'last_data_len') and (self.last_data_len - saved_xlim[1] < 5):
+                    was_at_edge = True
+            except: pass
 
-    def on_press(self, event):
-        """鼠标按下"""
-        if event.inaxes == self.ax_main and event.button == 1:
-            self.is_dragging = True
-            self.last_mouse_x = event.xdata
+        self.current_chart_symbol = symbol
 
-    def on_release(self, event):
-        """鼠标松开"""
-        self.is_dragging = False
-        self.last_mouse_x = None
+        # 1. 清理
+        for widget in self.tab_chart.winfo_children(): widget.destroy()
+        
+        # 2. 获取数据
+        tf_raw = self.combo_tf.get() 
+        df = self.backend.get_chart_data(symbol, tf_raw)
+        live_price = self.backend.get_latest_price_fast(symbol)
 
-    def on_drag_and_hover(self, event):
-        """处理拖拽平移 + HUD数据显示"""
-        if not hasattr(self, 'current_df') or self.current_df is None: return
-        if event.inaxes != self.ax_main: return
+        if df is None or df.empty:
+            ttk.Label(self.tab_chart, text="正在拉取最新数据...").pack(expand=True)
+            return
 
-        # 1. 拖拽平移逻辑
-        if self.is_dragging and self.last_mouse_x is not None and event.xdata is not None:
-            dx = event.xdata - self.last_mouse_x
-            x_min, x_max = self.ax_main.get_xlim()
-            
-            # 计算新位置 (反向移动视角)
-            new_min, new_max = x_min - dx, x_max - dx
-            
-            # 边界检查
-            if new_max > len(self.current_df):
-                diff = new_max - len(self.current_df)
-                new_max -= diff
-                new_min -= diff
-            if new_min < 0:
-                diff = 0 - new_min
-                new_min += diff
-                new_max += diff
-                
-            self.ax_main.set_xlim(new_min, new_max)
-            self.fig.canvas.draw_idle()
-            return # 拖拽时不更新HUD
+        # ==========================================
+        # 🔥 核心修复 1：统一转换为本地时间，并剥离时区信息 (tz-naive)
+        # ==========================================
+        # 1. 先确保 df 是 UTC
+        if df.index.tz is None: df.index = df.index.tz_localize('UTC')
+        else: df.index = df.index.tz_convert('UTC')
+        
+        # 2. 转为本地时间
+        my_timezone = datetime.datetime.now().astimezone().tzinfo
+        df.index = df.index.tz_convert(my_timezone)
+        
+        # 3. 🔥 剥离时区！变成纯粹的 "2023-12-07 16:22:00"
+        # 这样后续比对时，绝对不会因为时区格式不同而失败
+        df.index = df.index.tz_localize(None)
 
-        # 2. 悬停 HUD 逻辑
+        # 4. 计算对齐频率
+        freq_map = {"1Min": "1min", "5Min": "5min", "15Min": "15min", "1Hour": "1h"}
+        pd_freq = freq_map.get(tf_raw, "1min")
+
+        # 5. 加载交易记录
+        self.trade_markers = self.load_trade_history()
+        
+        # 6. 绘图风格
+        mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='inherit', wick='inherit', volume='in')
+        s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
+
+        # 7. 辅助线
+        hlines_list = []
+        hlines_colors = []
+        qty, pl, avg = self.backend.get_position(symbol)
+        if qty > 0:
+            hlines_list.append(avg)
+            hlines_colors.append('cyan')
+        if live_price > 0:
+            hlines_list.append(live_price)
+            hlines_colors.append('white')
+
+        plot_kwargs = dict(
+            type='candle', mav=(5, 20), volume=True, style=s, returnfig=True,
+            figsize=(12, 8), tight_layout=True, ylabel='Price ($)',
+            datetime_format='%m-%d %H:%M', xrotation=0
+        )
+        if hlines_list:
+            plot_kwargs['hlines'] = dict(hlines=hlines_list, colors=hlines_colors, linestyle='--', linewidths=1.0)
+
         try:
-            x_idx = int(round(event.xdata))
-            if 0 <= x_idx < len(self.current_df):
-                bar = self.current_df.iloc[x_idx]
-                info = (f"{self.current_chart_symbol} {bar.name.strftime('%H:%M')}\n"
-                        f"O:{bar['open']:.2f} H:{bar['high']:.2f}\n"
-                        f"L:{bar['low']:.2f} C:{bar['close']:.2f}\n"
-                        f"V:{float(bar['volume']):.4f}")
-                self.text_artist.set_text(info)
-                self.fig.canvas.draw_idle()
-        except: pass
+            # 8. 生成图表
+            self.fig, self.axlist = mpf.plot(df, **plot_kwargs)
+            self.ax_main = self.axlist[0]
+            
+            # ==========================================
+            # 🔥 核心修复 2：交易记录也剥离时区，进行纯时间比对
+            # ==========================================
+            if symbol in self.trade_markers:
+                history = self.trade_markers[symbol]
+                
+                for trade in history:
+                    try:
+                        # A. 解析时间并转为本地
+                        t_time = pd.to_datetime(trade['time'])
+                        if t_time.tz is None: t_time = t_time.tz_localize('UTC')
+                        else: t_time = t_time.tz_convert('UTC')
+                        
+                        t_time_local = t_time.tz_convert(my_timezone)
+                        
+                        # B. 🔥 剥离时区 (tz_localize(None))
+                        t_naive = t_time_local.tz_localize(None)
+
+                        # C. 地板除对齐 (16:22:52 -> 16:22:00)
+                        t_floored = t_naive.floor(pd_freq)
+
+                        # D. 核心判断：纯时间比对
+                        if t_floored in df.index:
+                            idx_label = t_floored
+                            
+                            # 获取坐标
+                            candle_low = df.loc[idx_label]['low']
+                            candle_high = df.loc[idx_label]['high']
+
+                            # E. 绘制杆子
+                            if trade['action'] == 'BUY':
+                                self.ax_main.annotate('B', xy=(idx_label, candle_low), xytext=(0, -20), 
+                                    textcoords='offset points', color='white', fontweight='bold', ha='center',
+                                    bbox=dict(boxstyle='round,pad=0.2', fc='#00b300', alpha=0.8),
+                                    arrowprops=dict(arrowstyle='->', color='#00b300', lw=1.5))
+                            elif trade['action'] == 'SELL':
+                                self.ax_main.annotate('S', xy=(idx_label, candle_high), xytext=(0, 20), 
+                                    textcoords='offset points', color='white', fontweight='bold', ha='center',
+                                    bbox=dict(boxstyle='round,pad=0.2', fc='#ff3333', alpha=0.8),
+                                    arrowprops=dict(arrowstyle='->', color='#ff3333', lw=1.5))
+                    except Exception as e:
+                        # print(f"Marker Error: {e}")
+                        pass
+
+            # --- HUD ---
+            last_bar = df.iloc[-1]
+            # 因为剥离了时区，这里直接格式化
+            t_str = last_bar.name.strftime('%Y-%m-%d %H:%M')
+            initial_text = (
+                f"{symbol} [{tf_raw}] {t_str}\n"
+                f"O: {last_bar['open']:.2f}  H: {last_bar['high']:.2f}\n"
+                f"L: {last_bar['low']:.2f}  C: {last_bar['close']:.2f}\n"
+                f"Vol: {float(last_bar['volume']):.4f}"
+            )
+            self.text_artist = self.ax_main.text(
+                0.02, 0.96, initial_text, 
+                transform=self.ax_main.transAxes, fontsize=10, color='white', verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='black', alpha=0.7)
+            )
+            
+            # 交互事件
+            self.current_df = df
+            self.fig.canvas.mpl_connect('scroll_event', self.on_scroll)
+            self.fig.canvas.mpl_connect('button_press_event', self.on_press)
+            self.fig.canvas.mpl_connect('button_release_event', self.on_release)
+            self.fig.canvas.mpl_connect('motion_notify_event', self.on_drag_and_hover)
+            self.is_dragging = False
+            self.last_mouse_x = None
+
+            # 8. 显示
+            canvas = FigureCanvasTkAgg(self.fig, master=self.tab_chart)
+            canvas.draw()
+            canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+            # 恢复视角
+            if saved_xlim:
+                current_len = len(df)
+                view_width = saved_xlim[1] - saved_xlim[0]
+                if was_at_edge:
+                    self.ax_main.set_xlim(current_len - view_width, current_len)
+                else:
+                    self.ax_main.set_xlim(saved_xlim)
+            
+            self.last_data_len = len(df)
+            
+        except Exception as e:
+            print(f"Plot Error: {e}")
+            ttk.Label(self.tab_chart, text=f"绘图出错: {e}").pack(expand=True)
 
     # ================= 交互事件处理函数 =================
 
@@ -560,50 +643,75 @@ class QuantGUI:
                     self.market_cache[symbol]['status'] = "分析中..."
                     self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
 
-                    # 1. 获取详细数据 (含指标)
+                    # 1. 获取详细数据
                     price, report = self.backend.get_analysis_data(symbol)
-                    
-                    # 同步一下持仓信息
                     qty, pl, avg = self.backend.get_position(symbol)
-                    self.market_cache[symbol].update({'qty': qty, 'avg': avg}) # 价格由另一个线程更新，这里只更新持仓
-
-                    # 2. 调用 AI (这里会阻塞很久，但不会影响 UI 价格刷新!)
-                    action, reason, thought = self.ai.analyze("deepseek-r1:8b", symbol, price, report, qty, avg)
                     
-                    self.log_ai(symbol, thought, action, reason)
-                    self.market_cache[symbol]['status'] = action # 更新状态
+                    # 更新缓存
+                    self.market_cache[symbol].update({'qty': qty, 'avg': avg})
+
+                    # 2. 调用 AI (获取 动作 + 比例)
+                    # 注意：现在 analyze 返回 4 个值
+                    action, pct, reason, thought = self.ai.analyze("deepseek-r1:8b", symbol, price, report, qty, avg)
+                    
+                    # 格式化一下 AI 的决定显示
+                    decision_str = f"{action} {pct}%" if action != "HOLD" else "HOLD"
+                    self.log_ai(symbol, thought, decision_str, reason)
+                    self.market_cache[symbol]['status'] = action 
                     self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
 
-                    # 3. 执行交易
+                    # 3. 执行复杂交易逻辑
+                    base_usd = float(self.entry_qty.get()) # 获取设置里的单笔金额
+
                     if action == "BUY":
-                        if qty == 0:
-                            success, msg = self.backend.place_order(symbol, "buy", float(self.entry_qty.get()), price)
-                            tag = "BUY" if success else "ERR"
-                            self.log_sys(f"[{symbol}] 买入: {msg}", tag)
-                            if success: 
-                                self.last_buy_time[symbol] = time.time()
-                                self.record_trade(symbol, 'BUY', price)
-                        else:
-                            self.log_sys(f"[{symbol}] 持有中，跳过")
+                        # 买入逻辑：按 base_usd 的百分比买入
+                        # 例如：Base=1000, AI说买50%，那就是加仓500刀
+                        if pct > 0:
+                            buy_usd = base_usd * (pct / 100.0)
+                            
+                            # 最小金额保护 ($10)
+                            if buy_usd < 10: 
+                                self.log_sys(f"[{symbol}] 买入金额 ${buy_usd:.2f} 太小，忽略")
+                            else:
+                                success, msg = self.backend.place_order(symbol, "buy", buy_usd, price)
+                                tag = "BUY" if success else "ERR"
+                                self.log_sys(f"[{symbol}] 买入 ${buy_usd:.0f} ({pct}%): {msg}", tag)
+                                if success: 
+                                    self.last_buy_time[symbol] = time.time()
+                                    self.record_trade(symbol, 'BUY', price)
 
                     elif action == "SELL":
-                        if qty > 0:
-                            # 冷却检查
-                            last = self.last_buy_time.get(symbol, 0)
-                            if time.time() - last < 300: # 5分钟保护
-                                self.log_sys(f"[{symbol}] 冷却保护中 (5min)", "WARN")
-                            else:
+                        if qty > 0 and pct > 0:
+                            # 卖出逻辑：按当前持仓数量的百分比卖出
+                            # 例如：持仓 1.0 ETH，AI说卖 50%，那就是卖 0.5 ETH
+                            
+                            # 如果是 100%，直接清仓（更稳健）
+                            if pct >= 99:
                                 success, msg = self.backend.close_full_position(symbol)
-                                tag = "SELL" if success else "ERR"
-                                self.log_sys(f"[{symbol}] 卖出: {msg}", tag)
-                                if success:
-                                    self.record_trade(symbol, 'SELL', price)
-                                    self.market_cache[symbol]['qty'] = 0 # 立即重置本地缓存
+                                sell_qty = qty
+                            else:
+                                # 计算卖出数量
+                                sell_qty = qty * (pct / 100.0)
+                                # 只有当卖出价值大于 $10 时才执行 (防止碎股报错)
+                                if (sell_qty * price) < 10:
+                                    self.log_sys(f"[{symbol}] 卖出价值太低，忽略")
+                                    success = False
+                                else:
+                                    success, msg = self.backend.submit_qty_order(symbol, "sell", sell_qty)
+                            
+                            tag = "SELL" if success else "ERR"
+                            if success:
+                                self.log_sys(f"[{symbol}] 卖出 {sell_qty:.4f} ({pct}%): {msg}", tag)
+                                self.record_trade(symbol, 'SELL', price)
+                                # 如果清仓了，重置冷却时间 (可选)
+                                if pct >= 99: 
+                                    self.market_cache[symbol]['qty'] = 0
+                        else:
+                            if qty == 0: self.log_sys(f"[{symbol}] 无持仓，无法卖出")
 
                 except Exception as e:
                     self.log_sys(f"Strategy Error {symbol}: {e}", "ERR")
             
-            # 这里的休息时间决定了 AI 的频率，建议 60秒
             self.log_sys("⏳ 周期结束，等待 60 秒...")
             for _ in range(60):
                 if not self.running: break
@@ -613,7 +721,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
-
 
 
 
