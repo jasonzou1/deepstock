@@ -86,63 +86,72 @@ class AlpacaBackend:
 
     def get_analysis_data(self, symbol):
         """
-        🐢【分析通道 - AI 专用】
-        获取 K 线 + 计算指标 + 提取近期形态
+        🔥【Hybrid 终极版】
+        既给 AI 看 K 线形态 (Arrays)，又给 AI 关键指标提示 (Hints)。
+        这是平衡“高上限”与“稳定性”的最佳方案。
         """
         if not self.connected: return 0, "No Connection"
         
         try:
-            # 1. 强制获取最近的数据 (防止 AI 分析旧数据)
             now_utc = datetime.now(timezone.utc)
-            start_time = (now_utc - timedelta(hours=4)).isoformat() # 只看最近4小时足够了
-            limit = 200 
-
+            
+            # 1. 宽视野：获取足够的数据计算指标
+            start_time = (now_utc - timedelta(hours=6)).isoformat()
             if "/" in symbol:
-                bars = self.api.get_crypto_bars(symbol, tradeapi.TimeFrame.Minute, start=start_time, limit=limit).df
+                bars = self.api.get_crypto_bars(symbol, tradeapi.TimeFrame.Minute, start=start_time, limit=300).df
             else:
-                bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, start=start_time, limit=limit).df
+                bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Minute, start=start_time, limit=300).df
 
             if bars.empty: return 0, "No Data"
 
-            # 2. 清洗数据
+            # 2. 数据清洗与指标计算
             df = bars.copy()
-            map_cols = {'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}
-            df.rename(columns=map_cols, inplace=True)
-            df.sort_index(inplace=True)
-
+            df.rename(columns={'c': 'close', 'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'}, inplace=True)
             current_price = float(df.iloc[-1]['close'])
 
-            # 3. 计算指标
+            # 计算技术指标
+            df.ta.ema(length=20, append=True)
             df.ta.rsi(length=14, append=True)
-            df.ta.macd(fast=12, slow=26, signal=9, append=True)
-            df.ta.bbands(length=20, std=2, append=True)
-            df.ta.sma(length=20, append=True)
+            df.ta.macd(append=True)
+            
+            # 3. 【核心保留】序列化数据 (让 AI 看形态)
+            # Alpha Arena 的精髓：提供最近 10-12 个点，让 AI 识别拐点和背离
+            tail = df.tail(12)
+            
+            def to_seq(series):
+                # 格式化为 [1.1, 1.2, ...] 字符串
+                return "[" + ", ".join([f"{x:.2f}" for x in series.values]) + "]"
 
-            latest = df.iloc[-1]
-            
-            # 4. 构建“近期 K 线形态数据” (给 AI 的眼睛)
-            # 取最近 15 根 K 线
-            recent_candles = df.tail(15)
-            candles_str = "Time (UTC)        | Open   | High   | Low    | Close  | Vol\n"
-            candles_str += "-" * 60 + "\n"
-            for index, row in recent_candles.iterrows():
-                t_str = index.strftime("%H:%M")
-                candles_str += f"{t_str} | {row['open']:.2f} | {row['high']:.2f} | {row['low']:.2f} | {row['close']:.2f} | {float(row['volume']):.4f}\n"
+            price_seq = to_seq(tail['close'])
+            rsi_seq   = to_seq(tail['RSI_14'])
+            macd_seq  = to_seq(tail['MACD_12_26_9'])
+            vol_seq   = to_seq(tail['volume'])
 
-            # 5. 生成报告
-            trend_str = "BULLISH" if current_price > latest.get('SMA_20', 0) else "BEARISH"
+            # 4. 【安全垫】Python 计算硬结论 (辅助小模型不犯错)
+            last = df.iloc[-1]
+            # 趋势提示
+            ema20 = last['EMA_20']
+            trend_hint = "UP (Price > EMA20)" if current_price > ema20 else "DOWN (Price < EMA20)"
+            # RSI 提示
+            rsi_val = last['RSI_14']
+            rsi_hint = "OVERBOUGHT (>70)" if rsi_val > 70 else ("OVERSOLD (<30)" if rsi_val < 30 else "NEUTRAL")
+
+            # 5. 构建报告：既有“直接结论”，又有“原始数据”
+            report = f"""
+            *** MARKET SNAPSHOT ***
+            Current Price: {current_price:.2f}
             
-            report = f"*** MARKET DATA ***\n"
-            report += f"Current Price: {current_price:.2f}\n"
-            report += f"Trend (vs SMA20): {trend_str}\n\n"
+            [PYTHON HINTS] (Use these as baseline context)
+            - Trend: {trend_hint}
+            - RSI State: {rsi_hint} ({rsi_val:.1f})
             
-            report += f"*** TECHNICAL INDICATORS (Latest) ***\n"
-            report += f"RSI(14): {latest.get('RSI_14', 50):.2f}\n"
-            report += f"MACD: {latest.get('MACD_12_26_9', 0):.2f}\n"
-            report += f"Bollinger: {latest.get('BBL_20_2.0', 0):.2f} (Low) / {latest.get('BBU_20_2.0', 0):.2f} (High)\n\n"
-            
-            report += f"*** RECENT 15 MIN PRICE ACTION (Must Analyze Patterns) ***\n"
-            report += candles_str
+            [RAW DATA SEQUENCES] (Analyze these for patterns, divergence, or momentum shifts)
+            - Data Order: OLDEST -> NEWEST (Last 12 mins)
+            - Price: {price_seq}
+            - RSI14: {rsi_seq}
+            - MACD : {macd_seq}
+            - Vol  : {vol_seq}
+            """
             
             return current_price, report
 
@@ -231,5 +240,6 @@ class AlpacaBackend:
             self.api.submit_order(symbol=real_symbol, qty=qty, side='sell', type='market', time_in_force='gtc')
             return True, f"已清仓卖出 {qty}"
         except Exception as e: return False, str(e)
+
 
 
