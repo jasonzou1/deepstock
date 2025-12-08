@@ -2,15 +2,7 @@ import requests
 import json
 import re
 import config
-
-class DeepSeekAgent:
-    def __init__(self):
-        self.url = config.OLLAMA_URL
-
-    import requests
-import json
-import re
-import config
+from datetime import datetime  # 必须保留这行导入
 
 class DeepSeekAgent:
     def __init__(self):
