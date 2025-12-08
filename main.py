@@ -679,6 +679,10 @@ class QuantGUI:
         while self.running:
             self.log_sys("🔍 AI 开始新一轮全量扫描...")
             
+            # 获取最新账户信息
+            available_cash, total_equity = self.backend.get_account_info()
+            self.log_sys(f"🏦 当前可用资金: ${available_cash:,.2f} | 总净值: ${total_equity:,.2f}")
+
             for symbol in self.symbols_list:
                 if not self.running: break
                 
@@ -694,62 +698,84 @@ class QuantGUI:
                     # 更新缓存
                     self.market_cache[symbol].update({'qty': qty, 'avg': avg})
 
-                    # 2. 调用 AI (获取 动作 + 比例)
-                    # 注意：现在 analyze 返回 4 个值
-                    action, pct, reason, thought = self.ai.analyze("deepseek-r1:8b", symbol, price, report, qty, avg)
+                    # 2. 调用 AI (获取 动作 + 绝对金额)
+                    # 🔥 核心修改：接收 amount_usd
+                    action, amount_usd, reason, thought = self.ai.analyze(
+                        "deepseek-r1:8b", 
+                        symbol, 
+                        price, 
+                        report, 
+                        qty, 
+                        avg, 
+                        available_cash, 
+                        total_equity    
+                    )
                     
                     # 格式化一下 AI 的决定显示
-                    decision_str = f"{action} {pct}%" if action != "HOLD" else "HOLD"
+                    # 🔥 核心修改：显示 AI 决定的金额
+                    decision_str = f"{action} ${amount_usd:,.2f}" if action != "HOLD" else "HOLD"
                     self.log_ai(symbol, thought, decision_str, reason)
                     self.market_cache[symbol]['status'] = action 
                     self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
 
                     # 3. 执行复杂交易逻辑
-                    base_usd = float(self.entry_qty.get()) # 获取设置里的单笔金额
-
+                    
                     if action == "BUY":
-                        # 买入逻辑：按 base_usd 的百分比买入
-                        # 例如：Base=1000, AI说买50%，那就是加仓500刀
-                        if pct > 0:
-                            buy_usd = base_usd * (pct / 100.0)
+                        buy_usd = amount_usd
+                        
+                        if buy_usd > 0.0:
+                            # 🔥 核心修复：资金检查 (保持不变，作为最终安全保障)
+                            # 如果订单金额大于可用现金，则警告并截断，但由于 AI 已经知道现金，这里只是双重保险
+                            if buy_usd > available_cash:
+                                self.log_sys(f"[{symbol}] ⚠️ 资金不足！AI请求 ${buy_usd:,.2f}，可用 ${available_cash:,.2f}。已截断至可用余额。", "WARN")
+                                buy_usd = available_cash # 截断至可用余额
                             
                             # 最小金额保护 ($10)
-                            if buy_usd < 10: 
+                            if buy_usd < 10.0: 
                                 self.log_sys(f"[{symbol}] 买入金额 ${buy_usd:.2f} 太小，忽略")
                             else:
+                                # 使用 place_order (按金额下单)
                                 success, msg = self.backend.place_order(symbol, "buy", buy_usd, price)
                                 tag = "BUY" if success else "ERR"
-                                self.log_sys(f"[{symbol}] 买入 ${buy_usd:.0f} ({pct}%): {msg}", tag)
+                                self.log_sys(f"[{symbol}] 买入 ${buy_usd:,.2f} : {msg}", tag)
                                 if success: 
                                     self.last_buy_time[symbol] = time.time()
                                     self.record_trade(symbol, 'BUY', price)
-
+                                    # 如果下单成功，立即更新可用现金，防止下次订单超额
+                                    available_cash -= buy_usd
+                                    
                     elif action == "SELL":
-                        if qty > 0 and pct > 0:
-                            # 卖出逻辑：按当前持仓数量的百分比卖出
-                            # 例如：持仓 1.0 ETH，AI说卖 50%，那就是卖 0.5 ETH
+                        sell_value_usd = amount_usd # AI决定的卖出价值
+                        
+                        if qty > 0 and sell_value_usd > 0.0:
+                            current_position_value = qty * price
                             
-                            # 如果是 100%，直接清仓（更稳健）
-                            if pct >= 99:
+                            # 🔥 核心逻辑：判断AI是想清仓还是部分卖出
+                            # AI请求的卖出金额如果接近当前仓位价值，执行清仓
+                            if sell_value_usd >= current_position_value * 0.99:
                                 success, msg = self.backend.close_full_position(symbol)
                                 sell_qty = qty
                             else:
-                                # 计算卖出数量
-                                sell_qty = qty * (pct / 100.0)
-                                # 只有当卖出价值大于 $10 时才执行 (防止碎股报错)
-                                if (sell_qty * price) < 10:
-                                    self.log_sys(f"[{symbol}] 卖出价值太低，忽略")
+                                # 部分卖出：计算要卖出的数量
+                                sell_qty = sell_value_usd / price
+                                
+                                # 只有当卖出价值大于 $10 时才执行
+                                if sell_value_usd < 10.0:
+                                    self.log_sys(f"[{symbol}] 卖出价值 ${sell_value_usd:.2f} 太低，忽略")
                                     success = False
                                 else:
+                                    # 使用 submit_qty_order (按数量下单)
                                     success, msg = self.backend.submit_qty_order(symbol, "sell", sell_qty)
                             
                             tag = "SELL" if success else "ERR"
                             if success:
-                                self.log_sys(f"[{symbol}] 卖出 {sell_qty:.4f} ({pct}%): {msg}", tag)
+                                # 打印请求的价值
+                                self.log_sys(f"[{symbol}] 卖出 ${sell_value_usd:,.2f}: {msg}", tag)
                                 self.record_trade(symbol, 'SELL', price)
-                                # 如果清仓了，重置冷却时间 (可选)
-                                if pct >= 99: 
+                                # 如果清仓了，重置缓存
+                                if sell_value_usd >= current_position_value * 0.99: 
                                     self.market_cache[symbol]['qty'] = 0
+
                         else:
                             if qty == 0: self.log_sys(f"[{symbol}] 无持仓，无法卖出")
 
@@ -760,10 +786,10 @@ class QuantGUI:
             for _ in range(60):
                 if not self.running: break
                 time.sleep(1)
-
 if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
+
 
 
