@@ -2,15 +2,16 @@ import requests
 import json
 import re
 import config
+import time
 from datetime import datetime  # 必须保留这行导入
 
 class DeepSeekAgent:
     def __init__(self):
         self.url = config.OLLAMA_URL
 
-    def analyze(self, model_name, symbol, price, market_report, qty, avg_price, cash, equity, system_state):
+    def analyze(self, model_name, symbol, price, market_report, qty, avg_price, cash, equity, system_state, prev_memory=None):
         """
-        Hybrid 模式专用分析器：教 AI 结合硬指标与软形态
+        Hybrid 模式专用分析器：教 AI 结合硬指标与软形态，并拥有连续记忆
         """
         
         # 1. 构建持仓状态
@@ -27,8 +28,20 @@ class DeepSeekAgent:
             - Unrealized PnL: ${unrealized_pl:.2f} ({pl_pct:.2f}%)
             """
 
-        # 2. 构建 Prompt (核心修改点)
-        # 我们修改了 [DECISION LOGIC] 部分，让它专门利用 "PYTHON HINTS" 和 "RAW DATA"
+        # 2. 构建记忆模块 (新增)
+        memory_block = "No previous memory (First run or reset)."
+        if prev_memory:
+            # 计算距离上次思考过了多久
+            time_diff = int(time.time() - prev_memory.get('timestamp', time.time()))
+            memory_block = f"""
+            [YOUR PREVIOUS THOUGHTS] ({time_diff} seconds ago)
+            - Last Action: {prev_memory.get('action', 'UNKNOWN')}
+            - Last Reasoning: "{prev_memory.get('reason', 'None')}"
+            
+            (SELF-REFLECTION: Does your previous logic still hold true? Don't flip-flop unless market structure changed.)
+            """
+
+        # 3. 构建 Prompt
         prompt = f"""
         [SYSTEM STATUS]
         - Runtime: {system_state.get('run_time_min', 0)} min | Loop: {system_state.get('loop_count', 0)}
@@ -36,6 +49,9 @@ class DeepSeekAgent:
         
         [OBJECTIVE]
         Aggressive Scalper. Capitalize on trends, but protect capital strictly.
+        
+        [STRATEGY MEMORY]
+        {memory_block}
         
         [DATA INPUT]
         {market_report}
@@ -48,16 +64,14 @@ class DeepSeekAgent:
         
         1. **STEP 1: Read [PYTHON HINTS]**
            - This is your BASELINE. If Trend is 'DOWN' and RSI is 'NEUTRAL', your bias is SELL or STAY OUT.
-           - Do NOT fight the math unless you see a clear reversal pattern.
            
         2. **STEP 2: Analyze [RAW DATA SEQUENCES]**
-           - Look for DIVERGENCE (e.g., Price making Lower Lows, but RSI making Higher Lows -> Potential BUY).
-           - Look for MOMENTUM SHIFTS in MACD arrays.
-           - Confirm if the Python Hint is still valid right now.
+           - Look for DIVERGENCE or MOMENTUM SHIFTS.
+           - Compare with [STRATEGY MEMORY]: If you bought recently, give the trade room to breathe unless invalidation hit.
            
         3. **STEP 3: Execute**
            - BUY: If Trend is UP or significant Bullish Divergence found. (Max 20% of Cash).
-           - SELL: If Trend is DOWN, RSI Overbought (>70), or Stop Loss hit.
+           - SELL: If Trend is DOWN, RSI Overbought (>70), Stop Loss hit, or Thesis Failed.
            - HOLD: If signals are mixed or chopping.
 
         [OUTPUT JSON ONLY]
@@ -68,7 +82,7 @@ class DeepSeekAgent:
         }}
         """
         
-        # --- 下面的发送请求代码保持不变 ---
+        # --- 发送请求 ---
         payload = {
             "model": model_name,
             "prompt": prompt,
@@ -83,10 +97,7 @@ class DeepSeekAgent:
                 raw_res = resp.json()['response']
                 print(f"\n[{symbol}] AI RAW OUTPUT:\n{raw_res}\n{'-'*30}")
                 
-                # ... (后续的解析代码完全保持不变) ...
-                # 复制你之前的解析代码即可
-                
-                # --- 为了方便，这里把解析代码也贴一下 ---
+                # --- 解析逻辑 ---
                 thought = "无思考"
                 think_match = re.search(r'<think>(.*?)</think>', raw_res, re.DOTALL)
                 if think_match:
