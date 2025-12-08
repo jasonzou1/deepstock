@@ -602,6 +602,9 @@ class QuantGUI:
             if not self.symbols_list: return messagebox.showerror("错误", "交易对为空")
             
             self.running = True
+            # 🔥 新增：初始化系统状态计数器 (配合 Alpha Arena 逻辑)
+            self.start_time = time.time()  # 记录启动时间戳
+            self.loop_counter = 0          # 重置循环次数
             self.btn_start.config(text="⏹ 停止")
             
             # 初始化 Treeview 和 缓存
@@ -644,152 +647,185 @@ class QuantGUI:
             ))
 
     def monitor_prices_loop(self):
-        """【线程1】更新价格 + 自动刷新图表"""
+        """
+        【线程1】轻量级高频循环 (每 1 秒)
+        任务：
+        1. 快速轮询最新成交价 (HTTP/Websocket)
+        2. 更新 UI 表格 (浮动盈亏、现价)
+        3. 定时触发 K 线图刷新 (不阻塞主线程)
+        """
         tick_count = 0
+        
         while self.running:
-            # 1. 更新价格 (保持原有逻辑)
+            # --- 任务 A: 快速更新所有币种价格 ---
             for symbol in self.symbols_list:
                 if not self.running: break
                 try:
+                    # 使用极速通道获取价格
                     price = self.backend.get_latest_price_fast(symbol)
+                    
                     if price > 0:
-                        cache = self.market_cache[symbol]
-                        cache['price'] = price
-                        if cache['qty'] > 0:
-                            cache['pl'] = (price - cache['avg']) * cache['qty']
-                        self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
-                except: pass
-            
-            # 2. 🔥 自动刷新图表逻辑 (每 5 秒刷新一次)
-            # 检查当前选中的是不是 "K线分析" 标签页
+                        # 更新共享缓存 (Thread-Safe)
+                        if symbol in self.market_cache:
+                            cache = self.market_cache[symbol]
+                            cache['price'] = price
+                            
+                            # 实时计算浮动盈亏 (PnL)
+                            if cache['qty'] > 0:
+                                cache['pl'] = (price - cache['avg']) * cache['qty']
+                            
+                            # 提交 UI 更新任务到主线程
+                            self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
+                            
+                except Exception as e:
+                    print(f"[{symbol}] Price Monitor Error: {e}")
+
+            # --- 任务 B: 自动刷新 K 线图 (每 5 秒一次) ---
+            # 只有当用户正在查看 "K线分析" 页面时才刷新，节省资源
             try:
+                # 获取当前选中的 Tab 索引 (0=列表, 1=图表)
+                # 注意：跨线程访问 GUI 属性需要小心，这里用 try-catch 兜底
                 current_tab = self.notebook.index(self.notebook.select())
-                if current_tab == 1 and self.current_chart_symbol: # 1 是图表页的索引
+                
+                if current_tab == 1 and self.current_chart_symbol:
                     tick_count += 1
-                    if tick_count >= 5: # 每循环 5 次 (约5秒) 刷新一次图表
+                    if tick_count >= 5: # 5秒阈值
+                        # 使用 lambda 传参，确保在主线程执行绘图
                         self.root.after(0, lambda: self.plot_chart(self.current_chart_symbol))
                         tick_count = 0
             except:
-                pass
+                pass # 比如刚启动时 tab 可能未准备好
 
+            # 休眠 1 秒
             time.sleep(1.0)
 
     def strategy_loop(self):
-        """【线程2】负责重型任务：拉K线、AI思考、下单"""
+        """
+        【线程2】重量级决策循环 (每 60 秒) - 引入 Alpha Arena 状态感知
+        任务：
+        1. 构建系统状态 (运行时间、轮次)
+        2. 拉取双周期数据 (1m + 1h)
+        3. 让 AI 结合账户状态进行推理
+        4. 执行 AI 的 JSON 指令
+        """
         while self.running:
-            self.log_sys("🔍 AI 开始新一轮全量扫描...")
+            self.log_sys("🔍 AI 正在构建环境感知...", "WARN")
             
-            # 获取最新账户信息
+            # --- 1. 更新系统状态 (Alpha Arena 核心: 时间感知) ---
+            # [cite: 68-70, 153-160] 让 AI 知道系统运行了多久，建立时间连续性
+            self.loop_counter += 1
+            run_minutes = int((time.time() - self.start_time) / 60)
+            
+            system_state = {
+                "run_time_min": run_minutes,
+                "loop_count": self.loop_counter
+            }
+
+            # 获取最新账户资金
             available_cash, total_equity = self.backend.get_account_info()
-            self.log_sys(f"🏦 当前可用资金: ${available_cash:,.2f} | 总净值: ${total_equity:,.2f}")
+            self.log_sys(f"⏳ 第 {self.loop_counter} 轮 | 运行 {run_minutes}m | 现金: ${available_cash:,.2f}")
 
             for symbol in self.symbols_list:
                 if not self.running: break
                 
                 try:
-                    # 更新状态显示
-                    self.market_cache[symbol]['status'] = "分析中..."
+                    # 更新 UI 状态
+                    self.market_cache[symbol]['status'] = "🧠 思考中..."
                     self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
 
-                    # 1. 获取详细数据
+                    # --- 2. 获取增强版数据 (1m + 1h + 指标序列) ---
+                    # 这里调用的是改良后的 backend.get_analysis_data
                     price, report = self.backend.get_analysis_data(symbol)
+                    
+                    if price <= 0:
+                        self.log_sys(f"[{symbol}] 数据获取失败，跳过", "ERR")
+                        continue
+
+                    # 获取持仓信息
                     qty, pl, avg = self.backend.get_position(symbol)
                     
-                    # 更新缓存
+                    # 同步缓存
                     self.market_cache[symbol].update({'qty': qty, 'avg': avg})
 
-                    # 2. 调用 AI (获取 动作 + 绝对金额)
-                    # 🔥 核心修改：接收 amount_usd
+                    # --- 3. 调用 AI Agent (注入系统状态) ---
+                    # [cite: 323-338] 传入持仓、资金、市场数据和系统状态
                     action, amount_usd, reason, thought = self.ai.analyze(
-                        "deepseek-r1:8b", 
-                        symbol, 
-                        price, 
-                        report, 
-                        qty, 
-                        avg, 
-                        available_cash, 
-                        total_equity    
+                        model_name="deepseek-r1:8b", 
+                        symbol=symbol, 
+                        price=price, 
+                        market_report=report, 
+                        qty=qty, 
+                        avg_price=avg, 
+                        cash=available_cash, 
+                        equity=total_equity,
+                        system_state=system_state  # <--- 新增参数：注入时间感知
                     )
                     
-                    # 格式化一下 AI 的决定显示
-                    # 🔥 核心修改：显示 AI 决定的金额
+                    # 格式化决策结果
                     decision_str = f"{action} ${amount_usd:,.2f}" if action != "HOLD" else "HOLD"
                     self.log_ai(symbol, thought, decision_str, reason)
                     self.market_cache[symbol]['status'] = action 
                     self.root.after(0, lambda s=symbol: self.update_ui_safe(s))
 
-                    # 3. 执行复杂交易逻辑
+                    # --- 4. 执行交易指令 ---
                     
+                    # [CASE A: BUY]
                     if action == "BUY":
                         buy_usd = amount_usd
                         
-                        if buy_usd > 0.0:
-                            # 🔥 核心修复：资金检查 (保持不变，作为最终安全保障)
-                            # 如果订单金额大于可用现金，则警告并截断，但由于 AI 已经知道现金，这里只是双重保险
-                            if buy_usd > available_cash:
-                                self.log_sys(f"[{symbol}] ⚠️ 资金不足！AI请求 ${buy_usd:,.2f}，可用 ${available_cash:,.2f}。已截断至可用余额。", "WARN")
-                                buy_usd = available_cash # 截断至可用余额
+                        # 资金双重检查
+                        if buy_usd > available_cash:
+                            self.log_sys(f"[{symbol}] ⚠️ 资金不足 (${buy_usd} > ${available_cash})，已修正", "WARN")
+                            buy_usd = available_cash
                             
-                            # 最小金额保护 ($10)
-                            if buy_usd < 10.0: 
-                                self.log_sys(f"[{symbol}] 买入金额 ${buy_usd:.2f} 太小，忽略")
-                            else:
-                                # 使用 place_order (按金额下单)
-                                success, msg = self.backend.place_order(symbol, "buy", buy_usd, price)
-                                tag = "BUY" if success else "ERR"
-                                self.log_sys(f"[{symbol}] 买入 ${buy_usd:,.2f} : {msg}", tag)
-                                if success: 
-                                    self.last_buy_time[symbol] = time.time()
-                                    self.record_trade(symbol, 'BUY', price)
-                                    # 如果下单成功，立即更新可用现金，防止下次订单超额
-                                    available_cash -= buy_usd
-                                    
-                    elif action == "SELL":
-                        sell_value_usd = amount_usd # AI决定的卖出价值
-                        
-                        if qty > 0 and sell_value_usd > 0.0:
-                            current_position_value = qty * price
+                        # 执行下单
+                        if buy_usd >= 10.0: 
+                            success, msg = self.backend.place_order(symbol, "buy", buy_usd, price)
+                            tag = "BUY" if success else "ERR"
+                            self.log_sys(f"[{symbol}] 买入 ${buy_usd:,.2f} : {msg}", tag)
                             
-                            # 🔥 核心逻辑：判断AI是想清仓还是部分卖出
-                            # AI请求的卖出金额如果接近当前仓位价值，执行清仓
-                            if sell_value_usd >= current_position_value * 0.99:
-                                success, msg = self.backend.close_full_position(symbol)
-                                sell_qty = qty
-                            else:
-                                # 部分卖出：计算要卖出的数量
-                                sell_qty = sell_value_usd / price
-                                
-                                # 只有当卖出价值大于 $10 时才执行
-                                if sell_value_usd < 10.0:
-                                    self.log_sys(f"[{symbol}] 卖出价值 ${sell_value_usd:.2f} 太低，忽略")
-                                    success = False
-                                else:
-                                    # 使用 submit_qty_order (按数量下单)
-                                    success, msg = self.backend.submit_qty_order(symbol, "sell", sell_qty)
-                            
-                            tag = "SELL" if success else "ERR"
-                            if success:
-                                # 打印请求的价值
-                                self.log_sys(f"[{symbol}] 卖出 ${sell_value_usd:,.2f}: {msg}", tag)
-                                self.record_trade(symbol, 'SELL', price)
-                                # 如果清仓了，重置缓存
-                                if sell_value_usd >= current_position_value * 0.99: 
-                                    self.market_cache[symbol]['qty'] = 0
-
+                            if success: 
+                                self.last_buy_time[symbol] = time.time()
+                                self.record_trade(symbol, 'BUY', price)
+                                available_cash -= buy_usd # 扣减临时余额，防止同一轮超买
                         else:
-                            if qty == 0: self.log_sys(f"[{symbol}] 无持仓，无法卖出")
+                            self.log_sys(f"[{symbol}] 买入金额过小 (${buy_usd})，忽略")
+
+                    # [CASE B: SELL]
+                    elif action == "SELL":
+                        sell_val_usd = amount_usd
+                        current_pos_val = qty * price
+                        
+                        if qty > 0 and sell_val_usd > 0:
+                            # 判断是清仓还是减仓
+                            is_full_exit = sell_val_usd >= (current_pos_val * 0.98) # 98%以上视为清仓
+                            
+                            if is_full_exit:
+                                success, msg = self.backend.close_full_position(symbol)
+                                self.log_sys(f"[{symbol}] 🚨 清仓卖出: {msg}", "SELL")
+                            else:
+                                # 计算卖出数量
+                                sell_qty = sell_val_usd / price
+                                success, msg = self.backend.submit_qty_order(symbol, "sell", sell_qty)
+                                self.log_sys(f"[{symbol}] 📉 减仓卖出 ${sell_val_usd:.2f}: {msg}", "SELL")
+                            
+                            if success:
+                                self.record_trade(symbol, 'SELL', price)
+                                if is_full_exit:
+                                    self.market_cache[symbol]['qty'] = 0 # 立即重置缓存
 
                 except Exception as e:
-                    self.log_sys(f"Strategy Error {symbol}: {e}", "ERR")
+                    self.log_sys(f"Strategy Error [{symbol}]: {e}", "ERR")
             
-            self.log_sys("⏳ 周期结束，等待 60 秒...")
+            # 倒计时等待下一轮
+            self.log_sys(f"⏳ 本轮结束，系统休眠 60 秒...", "WARN")
             for _ in range(60):
                 if not self.running: break
                 time.sleep(1)
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = QuantGUI(root)
     root.mainloop()
-
 
 
